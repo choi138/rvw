@@ -243,6 +243,25 @@ def test_report_resume_injects_synthesis_and_unknown_run_exits_one(
     assert "missing-run" in unknown.stderr
 
 
+@pytest.mark.parametrize(
+    ("command", "run_id"),
+    [("report", "nested/run"), ("publish", "../x")],
+)
+def test_run_consumers_reject_invalid_run_ids_as_user_errors(
+    tmp_path: Path,
+    command: str,
+    run_id: str,
+) -> None:
+    result = runner.invoke(
+        cli_module.app,
+        [command, "--run", run_id, "--out", str(tmp_path / "runs")],
+    )
+
+    assert result.exit_code == 2
+    assert "invalid run ID" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_publish_defaults_to_dry_run_and_non_pr_execute_is_user_error(
     tmp_path: Path,
     registry_root: Path,

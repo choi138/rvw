@@ -26,6 +26,7 @@ class Hunk(BaseModel):
     new_count: int
     added_lines: set[int]
     context_lines: set[int]
+    raw_text: str = ""
 
     @property
     def hunk_id(self) -> str:
@@ -69,18 +70,23 @@ def parse_hunks(diff: str) -> list[Hunk]:
     old_line = 0
     new_line = 0
 
-    for line in diff.splitlines():
+    for raw_line in diff.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
         header = _HUNK_HEADER.match(line)
         if header:
             if file is None:
                 continue
             active = _hunk_from_header(header, file)
+            active.raw_text = raw_line
             hunks.append(active)
             old_line = active.old_start
             new_line = active.new_start
+            if active.old_count == 0 and active.new_count == 0:
+                active = None
             continue
 
         if active is not None:
+            active.raw_text += raw_line
             if line.startswith("+"):
                 active.added_lines.add(new_line)
                 new_line += 1
@@ -114,45 +120,10 @@ def parse_hunks(diff: str) -> list[Hunk]:
 def hunk_sha256_by_id(diff: str) -> dict[str, str]:
     """Return SHA-256 digests of exact unified-diff hunk text by canonical hunk ID."""
 
-    digests: dict[str, str] = {}
-    old_path: str | None = None
-    file: str | None = None
-    active_id: str | None = None
-    active_lines: list[str] = []
-
-    def finish_active() -> None:
-        nonlocal active_id, active_lines
-        if active_id is not None:
-            digests[active_id] = hashlib.sha256("".join(active_lines).encode()).hexdigest()
-        active_id = None
-        active_lines = []
-
-    for raw_line in diff.splitlines(keepends=True):
-        line = raw_line.rstrip("\r\n")
-        header = _HUNK_HEADER.match(line)
-        if header:
-            finish_active()
-            if file is not None:
-                active_id = _hunk_from_header(header, file).hunk_id
-                active_lines = [raw_line]
-            continue
-        if line.startswith("diff --git "):
-            finish_active()
-            old_path = None
-            file = None
-            continue
-        if active_id is not None:
-            active_lines.append(raw_line)
-            continue
-        if line.startswith("--- "):
-            old_path = _header_path(line[4:])
-            continue
-        if line.startswith("+++ "):
-            new_path = _header_path(line[4:])
-            file = new_path or old_path
-
-    finish_active()
-    return digests
+    return {
+        hunk.hunk_id: hashlib.sha256(hunk.raw_text.encode()).hexdigest()
+        for hunk in parse_hunks(diff)
+    }
 
 
 def hunk_for_line(hunks: list[Hunk], file: str, line: int) -> Hunk | None:

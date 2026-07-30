@@ -15,19 +15,22 @@ This capability replaces a prose-and-copy-paste PR gate sequence with one artifa
 - Runs 105629 and 111704 both reviewed head `f9936ad`. An unchanged head uses the existing artifact-backed resume path and MUST NOT be re-targeted for a fresh review; re-targeting an identical head is operator error. A changed head starts a new target run and may inherit from the prior run's validated verdict.
 - The persisted gate verdict is the inheritance source because its dispositions have already passed exact-ID, completeness, duplicate, unknown-ID, and owner checks. BLOCK verdicts remain useful sources: their `must_fix` records never carry, but remain in the source set so mixed-disposition duplicate pairs stay ambiguous.
 - In target mode, `--inherit` source validation follows PR target resolution and precedes checkout provisioning and review execution.
-- Exact finding IDs encode diff coordinates rather than content. Tier-one carry therefore additionally compares SHA-256 digests of the persisted hunk text from each run. A changed or unavailable digest demotes to tier two; a unique `(file, rule_id)` match only prefills the reason for conscious re-acceptance. Duplicate pairs are counted across all inherited findings and all current actionable findings and deliberately under-carry.
+- Exact finding IDs encode diff coordinates rather than content, and an unchanged hunk still does not prove that a nondeterministic review produced the same diagnosis. Tier-one carry therefore compares SHA-256 digests of both the canonical hunk text and the representative finding body. A changed or unavailable digest demotes to tier two. Duplicate `(file, rule_id)` pairs are counted before exact matching across all inherited findings and all current actionable findings, so exact IDs can never bypass ambiguity.
 - Optional provenance remains backward compatible, but it is authoritative only after validation binds it to the selected source and a recomputed carried or prefilled match. Hand-authored provenance without that proof is rejected.
-- Partial-inheritance artifacts retain source-correlated carried, prefilled, and reasoned blank counts. Template comments distinguish changed-ID prefills, unmatched findings, prior-must-fix findings, ambiguity, and content-digest outcomes without weakening the strict YAML schema.
+- Partial-inheritance artifacts retain source-correlated carried, prefilled, and reasoned blank counts under a closed reason vocabulary. Final finding records retain the tier and blank or demotion reason, so a manually re-accepted tier-two prefill is distinguishable from a tier-one automatic carry. Template comments distinguish changed-ID prefills, unmatched findings, prior-must-fix findings, ambiguity, and content-digest outcomes without weakening the strict YAML schema.
+- A verdict with actionable counts but no finding records is the pause stub written before dispositions are validated, not a carry source. Inheritance rejects it and directs the operator to finish that run first; a clean verdict with no actionable counts remains valid.
+- Run IDs are restricted to a conservative ASCII direct-child alphabet before any filesystem lookup. Inheritance additionally rejects symlinked `target.json` and `gate-verdict.json` artifacts and verifies their real paths remain within the source run directory. Resume rejects self-inheritance before loading to preserve acyclic provenance and the source evidence.
+- Authorization subprocess failures are evidence-bearing gate outcomes: the BLOCK artifact records affected blockers, the lookup step, a resolved actor when actor lookup completed, and captured stderr.
 
 ## Constraints
 
 - Gate targets GitHub pull requests and requires working `gh` and `git` commands plus authenticated repository access.
 - The checkout clone fetches GitHub's `refs/pull/<number>/head` before detaching at the captured SHA so fork pull requests do not depend on the base branch advertising the commit.
-- Public finding IDs include hunk coordinates but not content; automatic inheritance additionally requires equal known hunk digests.
+- Public finding IDs include hunk coordinates but not content or diagnosis; automatic inheritance additionally requires equal known canonical hunk and representative-body digests on an unambiguous pair.
 - Resume requires the ordinary run stages and `gate-plan.json` written by target mode.
 - A coverage failure identifies the missing, unexpected, or invalid replica-chunk identity from persisted artifacts.
 - Inheritance is limited to persisted verdicts for the same repository and pull-request number. Base and head anchors may differ between the source and inheriting runs.
-- Run IDs are direct child names beneath the configured artifact root. Dot components, separators, symlinked entries, and resolved escapes are invalid lookup inputs.
+- Run IDs are direct child names beneath the configured artifact root and match `^[A-Za-z0-9._-]+$` except for `.` and `..`. Separators, controls, Markdown-active characters, symlinked entries or inheritance artifacts, and resolved escapes are invalid lookup inputs.
 
 ## Failure modes
 
@@ -35,7 +38,7 @@ This capability replaces a prose-and-copy-paste PR gate sequence with one artifa
 - GitHub installations without the pull-request ref namespace cannot use the current checkout provisioner.
 - Repository-admin authority may be narrower than an organization's informal owner group; configurable authority sources are outside this version.
 - `accepted` records a human judgment and cannot prove the judgment was substantively correct.
-- Legacy verdicts have no hunk digest. They remain readable, but exact-ID findings from them are conservatively handled as tier two until a digest-bearing verdict exists.
+- Legacy verdicts may lack hunk or body digests and per-finding inheritance diagnostics. They remain readable, but exact-ID findings from them are conservatively handled as tier two until both digest bindings are present.
 
 ## Concrete example
 

@@ -29,6 +29,7 @@ from rvw.gate import (
     GateInvariantError,
     GatePlan,
     GateVerdict,
+    GitHubAuthorizationError,
     InheritanceSummary,
     InheritanceTier,
     build_gate_verdict,
@@ -55,7 +56,7 @@ from rvw.registry import Registry, load_registry
 from rvw.report import render_report
 from rvw.runtimes.codex import CodexRuntime
 from rvw.sample import SampleReport, sample_lane
-from rvw.schema import Tier, Verdict, finding_schema, lane_output_schema
+from rvw.schema import Severity, Tier, Verdict, finding_schema, lane_output_schema
 from rvw.store import InvalidRunId, RunHandle, RunNotFound, RunStore, StageMissing
 from rvw.target import ResolvedTarget, TargetResolutionError, resolve_target
 
@@ -119,6 +120,15 @@ class _InheritanceSourceError(ValueError):
 def _write_json(payload: Any) -> None:
     json.dump(payload, sys.stdout)
     sys.stdout.write("\n")
+
+
+def _operational_error_detail(exc: OSError | subprocess.CalledProcessError | ValueError) -> str:
+    detail = str(exc)
+    if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+        stderr = str(exc.stderr).strip()
+        if stderr:
+            detail = f"{detail}; stderr: {stderr}"
+    return detail
 
 
 def _empty_review_failure(exc: EmptyReviewDiffError, *, json_output: bool) -> Never:
@@ -674,6 +684,15 @@ def _load_inherited_dispositions(
             "inherit_verdict_invalid",
             "gate verdict identity does not match its persisted run target",
         )
+    actionable_count = verdict.counts.get(Verdict.CONFIRMED.value, 0) + verdict.counts.get(
+        Verdict.UNCERTAIN.value, 0
+    )
+    if not verdict.findings and actionable_count > 0:
+        raise _InheritanceSourceError(
+            "inherit_source_incomplete",
+            f"source run {run_id} has {actionable_count} actionable findings but no completed "
+            f"dispositions; resume that run with dispositions first",
+        )
     return verdict
 
 
@@ -682,6 +701,7 @@ def _gate_failure_verdict(
     message: str,
     *,
     inheritance_summary: InheritanceSummary | None = None,
+    actor: str | None = None,
 ) -> GateVerdict:
     target = artifacts.target
     if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
@@ -694,6 +714,7 @@ def _gate_failure_verdict(
         counts=_verdict_counts(artifacts.outcome),
         coverage=artifacts.discovered.coverage,
         findings=[],
+        actor=actor,
         verdict="BLOCK",
         failures=[message],
         inheritance_summary=inheritance_summary,
@@ -736,6 +757,12 @@ def gate(
 
     if (target is None) == (run_id is None):
         _error_console.print("gate requires exactly one of --target or --run", markup=False)
+        raise typer.Exit(EXIT_USER_ERROR)
+    if run_id is not None and inherit_run_id == run_id:
+        _error_console.print(
+            "inherit_self_reference: --inherit must differ from --run",
+            markup=False,
+        )
         raise typer.Exit(EXIT_USER_ERROR)
     asyncio.run(
         _gate_pipeline(
@@ -824,6 +851,9 @@ async def _gate_pipeline(
         try:
             artifacts = _load_gate_artifacts(run_id, out_root)
             plan = load_gate_plan(artifacts.run.dir)
+        except InvalidRunId as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_USER_ERROR) from exc
         except (RunNotFound, StageMissing, OSError, ValueError) as exc:
             _error_console.print(str(exc), markup=False)
             raise typer.Exit(EXIT_NOT_FOUND) from exc
@@ -949,7 +979,56 @@ async def _gate_pipeline(
             inherited_run_id=inherit_run_id,
             inheritance=inheritance,
         ):
-            actor, permission = github_actor_permission(target.repo)
+            accepted_ids = {
+                record.finding_id
+                for record in dispositions.dispositions
+                if record.decision.value == "accepted"
+            }
+            blocker_ids = sorted(
+                group.key
+                for group in artifacts.merged.groups
+                if group.key in accepted_ids and group.severity is Severity.BLOCKER
+            )
+            try:
+                actor, permission = github_actor_permission(target.repo)
+            except GitHubAuthorizationError as exc:
+                actor = exc.actor
+                message = (
+                    "accepted_blocker_authorization_operational_failure: "
+                    f"run_id={artifacts.run.run_id} "
+                    f"finding_ids={','.join(blocker_ids) or '<none>'} "
+                    f"step={exc.step} actor={actor or '<unknown>'}; {exc.detail}"
+                )
+                save_gate_verdict(
+                    artifacts.run.dir,
+                    _gate_failure_verdict(
+                        artifacts,
+                        message,
+                        inheritance_summary=inheritance_summary,
+                        actor=actor,
+                    ),
+                )
+                _error_console.print(message, markup=False)
+                raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+            except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+                message = (
+                    "accepted_blocker_authorization_operational_failure: "
+                    f"run_id={artifacts.run.run_id} "
+                    f"finding_ids={','.join(blocker_ids) or '<none>'} "
+                    f"step=authorization_lookup actor={actor or '<unknown>'}; "
+                    f"{_operational_error_detail(exc)}"
+                )
+                save_gate_verdict(
+                    artifacts.run.dir,
+                    _gate_failure_verdict(
+                        artifacts,
+                        message,
+                        inheritance_summary=inheritance_summary,
+                        actor=actor,
+                    ),
+                )
+                _error_console.print(message, markup=False)
+                raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
         verdict = build_gate_verdict(
             run_id=artifacts.run.run_id,
             target=target,
@@ -1139,6 +1218,9 @@ def report_command(
         discovered = run.load_discover()
         merged = run.load_merge()
         outcome = _optional_outcome(run)
+    except InvalidRunId as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_USER_ERROR) from exc
     except (RunNotFound, StageMissing) as exc:
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_NOT_FOUND) from exc
@@ -1165,6 +1247,9 @@ def publish_command(
     try:
         run = RunStore(out_root).open(run_id)
         target = run.load_target()
+    except InvalidRunId as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_USER_ERROR) from exc
     except RunNotFound as exc:
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_SYSTEM_ERROR) from exc

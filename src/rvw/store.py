@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +18,9 @@ from rvw.target import ResolvedTarget
 
 if TYPE_CHECKING:
     from rvw.gate import GateVerdict
+
+
+_SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class RunNotFound(FileNotFoundError):
@@ -67,11 +70,24 @@ class RunHandle:
     run_id: str
     dir: Path
 
+    def _load_contained_json(self, name: str, stage: str) -> Any:
+        path = self.dir / name
+        if path.is_symlink():
+            raise InvalidRunId(self.run_id, self.dir.parent)
+        try:
+            resolved_path = path.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise StageMissing(stage, self.dir) from exc
+        resolved_dir = self.dir.resolve()
+        if not resolved_path.is_relative_to(resolved_dir) or resolved_path == resolved_dir:
+            raise InvalidRunId(self.run_id, self.dir.parent)
+        return _load_json(path, stage)
+
     def save_target(self, target: ResolvedTarget) -> None:
         _write_json(self.dir / "target.json", target.model_dump(mode="json"))
 
     def load_target(self) -> ResolvedTarget:
-        return ResolvedTarget.model_validate(_load_json(self.dir / "target.json", "target"))
+        return ResolvedTarget.model_validate(self._load_contained_json("target.json", "target"))
 
     def save_discover(self, discovered: DiscoverResult) -> None:
         _write_json(
@@ -148,7 +164,7 @@ class RunHandle:
         from rvw.gate import GateVerdict
 
         return GateVerdict.model_validate(
-            _load_json(self.dir / "gate-verdict.json", "gate-verdict")
+            self._load_contained_json("gate-verdict.json", "gate-verdict")
         )
 
 
@@ -175,8 +191,7 @@ class RunStore:
         return RunHandle(run_id=run_id, dir=run_dir)
 
     def open(self, run_id: str) -> RunHandle:
-        separators = tuple(item for item in (os.sep, os.altsep) if item is not None)
-        if not run_id or run_id in {".", ".."} or any(item in run_id for item in separators):
+        if not _SAFE_RUN_ID.fullmatch(run_id) or run_id in {".", ".."}:
             raise InvalidRunId(run_id, self.root)
         run_dir = self.root / run_id
         if run_dir.is_symlink():

@@ -40,3 +40,23 @@
 
 - [x] 8.1 Synchronize the delta and main pr-gate spec/context with the hardened contract.
 - [x] 8.2 Run the focused regressions, all bare repository gates, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.
+
+## 9. Round-2 matching and identity hardening
+
+- [x] 9.1 Add failing regressions for ambiguity precedence over exact matching, body-digest binding, and persisted per-finding inheritance outcomes.
+- [x] 9.2 Implement ambiguity-first matching, optional body digests, and per-finding inheritance diagnostics.
+
+## 10. Round-2 run and source integrity
+
+- [x] 10.1 Add failing CLI/store regressions for invalid run IDs, artifact symlink containment, self-inheritance, and incomplete inheritance sources.
+- [x] 10.2 Implement consistent invalid-input handling, safe run-ID validation, contained artifact reads, self-reference rejection, and source-completeness validation.
+
+## 11. Canonical hunk parsing and authorization diagnostics
+
+- [x] 11.1 Add failing regressions for canonical hunk digest boundaries and carried-blocker authorization operational failures.
+- [x] 11.2 Derive hunk digests from the canonical parser and persist authorization failures with actor and stderr context.
+
+## 12. Round-2 specification and verification
+
+- [x] 12.1 Synchronize the delta and main pr-gate spec/context with all round-2 requirements and rationale.
+- [x] 12.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.

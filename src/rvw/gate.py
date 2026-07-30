@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from collections import Counter
@@ -23,6 +24,16 @@ from rvw.target import ResolvedTarget
 
 class GateInvariantError(ValueError):
     """Persisted review data does not satisfy the fail-closed gate contract."""
+
+
+class GitHubAuthorizationError(RuntimeError):
+    """Operational failure while resolving blocker-acceptance authority."""
+
+    def __init__(self, *, step: str, actor: str | None, detail: str) -> None:
+        self.step = step
+        self.actor = actor
+        self.detail = detail
+        super().__init__(detail)
 
 
 class GateAnchor(BaseModel):
@@ -81,6 +92,21 @@ class DispositionDocument(BaseModel):
     dispositions: list[DispositionRecord]
 
 
+class InheritanceTier(StrEnum):
+    EXACT_ID = "exact_id"
+    UNIQUE_PAIR = "unique_pair"
+
+
+class InheritanceBlankReason(StrEnum):
+    UNMATCHED = "unmatched"
+    PRIOR_MUST_FIX = "prior_must_fix"
+    SOURCE_PAIR_AMBIGUOUS = "source_pair_ambiguous"
+    CURRENT_PAIR_AMBIGUOUS = "current_pair_ambiguous"
+    CONTENT_CHANGED = "content_changed"
+    CONTENT_DIGEST_UNKNOWN = "content_digest_unknown"
+    FINDING_ID_CHANGED = "finding_id_changed"
+
+
 class GateFinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -99,21 +125,14 @@ class GateFinding(BaseModel):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
-
-
-class InheritanceTier(StrEnum):
-    EXACT_ID = "exact_id"
-    UNIQUE_PAIR = "unique_pair"
-
-
-class InheritanceBlankReason(StrEnum):
-    UNMATCHED = "unmatched"
-    PRIOR_MUST_FIX = "prior_must_fix"
-    SOURCE_PAIR_AMBIGUOUS = "source_pair_ambiguous"
-    CURRENT_PAIR_AMBIGUOUS = "current_pair_ambiguous"
-    CONTENT_CHANGED = "content_changed"
-    CONTENT_DIGEST_UNKNOWN = "content_digest_unknown"
-    FINDING_ID_CHANGED = "finding_id_changed"
+    body_sha256: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    inheritance_tier: InheritanceTier | None = None
+    inheritance_blank_reason: InheritanceBlankReason | None = None
 
 
 class DispositionInheritance(BaseModel):
@@ -138,7 +157,7 @@ class InheritanceSummary(BaseModel):
     carried: int = Field(ge=0)
     prefilled: int = Field(ge=0)
     blank: int = Field(ge=0)
-    reasons: dict[str, int] = Field(default_factory=dict)
+    reasons: dict[InheritanceBlankReason, int] = Field(default_factory=dict)
 
 
 class GateVerdict(BaseModel):
@@ -285,6 +304,13 @@ def _dispositions_by_id(
     return {record.finding_id: record for record in document.dispositions}
 
 
+def _body_sha256(group: CollapseGroup) -> str:
+    """Digest the representative body rendered for a collapsed finding."""
+
+    representative = group.bodies[0] if group.bodies else ""
+    return hashlib.sha256(representative.encode()).hexdigest()
+
+
 def match_inherited_dispositions(
     inherited_findings: Sequence[GateFinding],
     merged: MergeResult,
@@ -314,30 +340,6 @@ def match_inherited_dispositions(
     }
 
     for group in actionable:
-        exact = accepted_by_id.get(group.key)
-        demotion_reason: InheritanceBlankReason | None = None
-        if exact is not None:
-            inherited_digest = exact.hunk_sha256
-            current_digest = current_digests.get(group.key)
-            if (
-                inherited_digest is not None
-                and current_digest is not None
-                and inherited_digest == current_digest
-            ):
-                results[group.key] = DispositionInheritance(
-                    finding_id=group.key,
-                    decision=DispositionDecision.ACCEPTED,
-                    reason=exact.reason,
-                    inherited_from=inherited_run_id,
-                    tier=InheritanceTier.EXACT_ID,
-                )
-                continue
-            demotion_reason = (
-                InheritanceBlankReason.CONTENT_CHANGED
-                if inherited_digest is not None and current_digest is not None
-                else InheritanceBlankReason.CONTENT_DIGEST_UNKNOWN
-            )
-
         pair = (group.file, group.rule_id)
         if inherited_pair_counts[pair] > 1:
             results[group.key] = DispositionInheritance(
@@ -351,6 +353,37 @@ def match_inherited_dispositions(
                 blank_reason=InheritanceBlankReason.CURRENT_PAIR_AMBIGUOUS,
             )
             continue
+
+        exact = accepted_by_id.get(group.key)
+        demotion_reason: InheritanceBlankReason | None = None
+        if exact is not None:
+            inherited_digest = exact.hunk_sha256
+            current_digest = current_digests.get(group.key)
+            inherited_body_digest = exact.body_sha256
+            current_body_digest = _body_sha256(group)
+            if (
+                inherited_digest is not None
+                and current_digest is not None
+                and inherited_digest == current_digest
+                and inherited_body_digest is not None
+                and inherited_body_digest == current_body_digest
+            ):
+                results[group.key] = DispositionInheritance(
+                    finding_id=group.key,
+                    decision=DispositionDecision.ACCEPTED,
+                    reason=exact.reason,
+                    inherited_from=inherited_run_id,
+                    tier=InheritanceTier.EXACT_ID,
+                )
+                continue
+            demotion_reason = (
+                InheritanceBlankReason.CONTENT_DIGEST_UNKNOWN
+                if inherited_digest is None
+                or current_digest is None
+                or inherited_body_digest is None
+                else InheritanceBlankReason.CONTENT_CHANGED
+            )
+
         inherited = inherited_by_pair.get(pair)
         if inherited is None:
             blank_reason = (
@@ -382,7 +415,7 @@ def summarize_inheritance(
     carried = 0
     prefilled = 0
     blank = 0
-    reasons: Counter[str] = Counter()
+    reasons: Counter[InheritanceBlankReason] = Counter()
     for result in inheritance.values():
         if result.tier is InheritanceTier.EXACT_ID:
             carried += 1
@@ -391,13 +424,13 @@ def summarize_inheritance(
         else:
             blank += 1
         if result.blank_reason is not None:
-            reasons[result.blank_reason.value] += 1
+            reasons[result.blank_reason] += 1
     return InheritanceSummary(
         source_run_id=source_run_id,
         carried=carried,
         prefilled=prefilled,
         blank=blank,
-        reasons=dict(sorted(reasons.items())),
+        reasons=dict(sorted(reasons.items(), key=lambda item: item[0].value)),
     )
 
 
@@ -456,6 +489,7 @@ def build_gate_verdict(
     blocked = False
     for group, verdict in actionable:
         record = by_id[group.key]
+        matched = inheritance.get(group.key) if inheritance is not None else None
         if record.decision is DispositionDecision.MUST_FIX:
             blocked = True
         if group.severity is Severity.BLOCKER and record.decision is DispositionDecision.ACCEPTED:
@@ -478,6 +512,9 @@ def build_gate_verdict(
                 reason=record.reason,
                 inherited_from=record.inherited_from,
                 hunk_sha256=hunk_digests.get(group.hunk_id),
+                body_sha256=_body_sha256(group),
+                inheritance_tier=matched.tier if matched is not None else None,
+                inheritance_blank_reason=(matched.blank_reason if matched is not None else None),
             )
         )
 
@@ -643,6 +680,15 @@ def _run(command: list[str]) -> str:
     return subprocess.run(command, check=True, capture_output=True, text=True).stdout
 
 
+def _authorization_error_detail(exc: OSError | subprocess.CalledProcessError) -> str:
+    detail = str(exc)
+    if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+        stderr = str(exc.stderr).strip()
+        if stderr:
+            detail = f"{detail}; stderr: {stderr}"
+    return detail
+
+
 def query_pull_request(
     repo: str,
     pr_number: int,
@@ -677,18 +723,36 @@ def github_actor_permission(
     *,
     run: Callable[[list[str]], str] = _run,
 ) -> tuple[str, str]:
-    actor = run(["gh", "api", "user", "--jq", ".login"]).strip()
+    try:
+        actor = run(["gh", "api", "user", "--jq", ".login"]).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise GitHubAuthorizationError(
+            step="actor_lookup",
+            actor=None,
+            detail=_authorization_error_detail(exc),
+        ) from exc
     if not actor:
-        raise ValueError("GitHub returned an empty authenticated actor")
-    permission = run(
-        [
-            "gh",
-            "api",
-            f"repos/{repo}/collaborators/{actor}/permission",
-            "--jq",
-            ".permission",
-        ]
-    ).strip()
+        raise GitHubAuthorizationError(
+            step="actor_lookup",
+            actor=None,
+            detail="GitHub returned an empty authenticated actor",
+        )
+    try:
+        permission = run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/collaborators/{actor}/permission",
+                "--jq",
+                ".permission",
+            ]
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise GitHubAuthorizationError(
+            step="permission_lookup",
+            actor=actor,
+            detail=_authorization_error_detail(exc),
+        ) from exc
     return actor, permission
 
 
@@ -736,6 +800,7 @@ __all__ = [
     "GateInvariantError",
     "GatePlan",
     "GateVerdict",
+    "GitHubAuthorizationError",
     "InheritanceBlankReason",
     "InheritanceSummary",
     "InheritanceTier",

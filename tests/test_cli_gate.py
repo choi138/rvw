@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 from typing import Literal
 
@@ -31,6 +32,7 @@ runner = CliRunner()
 HUNK_TEXT = "@@ -1 +1 @@\n-old\n+new\n"
 HUNK_DIFF = f"diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n{HUNK_TEXT}"
 HUNK_SHA256 = hashlib.sha256(HUNK_TEXT.encode()).hexdigest()
+BODY_SHA256 = hashlib.sha256(b"actionable").hexdigest()
 
 
 def target() -> ResolvedTarget:
@@ -190,6 +192,7 @@ def inherited_source(
                         disposition=DispositionDecision.ACCEPTED,
                         reason="accepted in prior run",
                         hunk_sha256=HUNK_SHA256,
+                        body_sha256=BODY_SHA256,
                     )
                 ],
                 verdict=verdict,
@@ -323,6 +326,44 @@ def test_gate_target_rejects_traversal_inherit_as_invalid_input(
     assert "inherit_run_invalid" in result.stderr
 
 
+def test_gate_resume_rejects_invalid_run_id_as_user_error(tmp_path: Path) -> None:
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--run", "nested/run", "--out", str(tmp_path / "runs")],
+    )
+
+    assert result.exit_code == 2
+    assert "invalid run ID" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_gate_rejects_self_inheritance_before_loading_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_load(run_id: str, out_root: Path) -> cli_module._PipelineArtifacts:
+        del run_id, out_root
+        raise AssertionError("self-inheritance reached run loading")
+
+    monkeypatch.setattr(cli_module, "_load_gate_artifacts", forbidden_load)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            "same-run",
+            "--inherit",
+            "same-run",
+            "--out",
+            str(tmp_path / "runs"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "inherit_self_reference" in result.stderr
+
+
 @pytest.mark.parametrize(
     ("source_setup", "reason"),
     [
@@ -365,6 +406,92 @@ def test_gate_inherit_source_errors_before_template_writing(
     assert result.exit_code == 2
     assert reason in result.stderr
     assert not (current.run.dir / "gate-dispositions.yaml").exists()
+
+
+def test_gate_inherit_rejects_symlinked_verdict_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        current.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    source = inherited_source(out_root, current)
+    foreign = tmp_path / "foreign-verdict.json"
+    foreign.write_text(
+        (source.dir / "gate-verdict.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (source.dir / "gate-verdict.json").unlink()
+    (source.dir / "gate-verdict.json").symlink_to(foreign)
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            current.run.run_id,
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "inherit_verdict_invalid" in result.stderr
+    assert not (current.run.dir / "gate-dispositions.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "expected_exit", "expected_text"),
+    [
+        ("stub", 2, "inherit_source_incomplete"),
+        ("clean", 1, "actionable findings require dispositions"),
+    ],
+)
+def test_gate_inheritance_source_requires_completed_actionable_dispositions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_kind: str,
+    expected_exit: int,
+    expected_text: str,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        current.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    source = inherited_source(out_root, current)
+    source_verdict = source.load_gate_verdict()
+    source_verdict.findings = []
+    if source_kind == "stub":
+        source_verdict.failures = ["actionable findings require explicit dispositions"]
+    else:
+        source_verdict.counts = {"CONFIRMED": 0, "REJECTED": 1, "UNCERTAIN": 0}
+        source_verdict.failures = []
+    save_gate_verdict(source.dir, source_verdict)
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            current.run.run_id,
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == expected_exit
+    assert expected_text in (result.stderr + result.stdout)
 
 
 def test_block_verdict_source_counts_mixed_dispositions_as_pair_ambiguity(
@@ -617,6 +744,56 @@ def test_gate_carried_blocker_reverifies_owner_authorization(
     assert current.merged.groups[0].key in failure
     assert "contributor" in failure
     assert "write" in failure
+    assert not (current.run.dir / "publish-payload.json").exists()
+
+
+def test_gate_persists_carried_blocker_authorization_operational_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True, blocker=True)
+    source = inherited_source(out_root, current)
+    patch_target_dependencies(monkeypatch, current)
+    real_permission_lookup = cli_module.github_actor_permission
+
+    def failed_permission_lookup(repo: str) -> tuple[str, str]:
+        def fake_run(command: list[str]) -> str:
+            if command[:3] == ["gh", "api", "user"]:
+                return "repo-owner\n"
+            raise subprocess.CalledProcessError(
+                returncode=1,
+                cmd=command,
+                stderr="permission endpoint denied the request",
+            )
+
+        return real_permission_lookup(repo, run=fake_run)
+
+    monkeypatch.setattr(cli_module, "github_actor_permission", failed_permission_lookup)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--target",
+            "42",
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 3
+    persisted = current.run.load_gate_verdict()
+    assert persisted.verdict == "BLOCK"
+    assert persisted.actor == "repo-owner"
+    failure = persisted.failures[0]
+    assert "accepted_blocker_authorization_operational_failure" in failure
+    assert current.merged.groups[0].key in failure
+    assert "permission" in failure
+    assert "permission endpoint denied the request" in failure
+    assert "permission endpoint denied the request" in result.stderr
     assert not (current.run.dir / "publish-payload.json").exists()
 
 

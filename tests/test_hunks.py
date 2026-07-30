@@ -1,4 +1,6 @@
-from rvw.hunks import hunk_for_line, is_anchorable, parse_hunks
+import hashlib
+
+from rvw.hunks import hunk_for_line, hunk_sha256_by_id, is_anchorable, parse_hunks
 
 MULTI_HUNK_DIFF = """\
 diff --git a/src/a.ts b/src/a.ts
@@ -168,3 +170,20 @@ rename to src/after.ts
 
     assert hunk.file == "src/after.ts"
     assert is_anchorable([hunk], "src/after.ts", 2)
+
+
+def test_hunk_digest_uses_canonical_parser_boundaries() -> None:
+    hunk_text = "@@ -1 +1 @@\n-old();\n+newCall();\n"
+    diff = (
+        "diff --git a/src/a.ts b/src/a.ts\n"
+        "--- a/src/a.ts\n"
+        "+++ b/src/a.ts\n"
+        f"{hunk_text}"
+        "trailing non-hunk text that must not affect the digest\n"
+    )
+
+    hunk = parse_hunks(diff)[0]
+    digests = hunk_sha256_by_id(diff)
+
+    assert hunk.raw_text == hunk_text
+    assert digests == {hunk.hunk_id: hashlib.sha256(hunk_text.encode()).hexdigest()}

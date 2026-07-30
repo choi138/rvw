@@ -18,6 +18,8 @@ from rvw.gate import (
     GateFinding,
     GateInvariantError,
     GatePlan,
+    InheritanceBlankReason,
+    InheritanceSummary,
     InheritanceTier,
     PullRequestState,
     build_gate_verdict,
@@ -42,6 +44,7 @@ from rvw.target import ResolvedTarget
 HUNK_TEXT = "@@ -1 +1 @@\n-old\n+new\n"
 HUNK_DIFF = f"diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n{HUNK_TEXT}"
 HUNK_SHA256 = hashlib.sha256(HUNK_TEXT.encode()).hexdigest()
+BODY_SHA256 = hashlib.sha256(b"actionable").hexdigest()
 
 
 def target() -> ResolvedTarget:
@@ -374,6 +377,7 @@ def _inherited_finding(
     decision: DispositionDecision = DispositionDecision.ACCEPTED,
     reason: str = "prior owner judgment",
     hunk_sha256: str | None = None,
+    body_sha256: str | None = None,
 ) -> GateFinding:
     return GateFinding(
         finding_id=finding_id,
@@ -385,6 +389,7 @@ def _inherited_finding(
         disposition=decision,
         reason=reason,
         hunk_sha256=hunk_sha256,
+        body_sha256=body_sha256,
     )
 
 
@@ -426,6 +431,7 @@ def test_inheritance_matcher_exact_id_carries_and_unique_pair_prefills() -> None
                 rule_id=group.rule_id,
                 file=group.file,
                 hunk_sha256="1" * 64,
+                body_sha256=BODY_SHA256,
             )
         ],
         merged,
@@ -478,6 +484,7 @@ def test_inheritance_matcher_demotes_exact_id_without_equal_known_hunk_digest(
                 rule_id=group.rule_id,
                 file=group.file,
                 hunk_sha256=source_digest,
+                body_sha256=BODY_SHA256,
             )
         ],
         merged,
@@ -490,6 +497,41 @@ def test_inheritance_matcher_demotes_exact_id_without_equal_known_hunk_digest(
     assert result.decision is DispositionDecision.MUST_FIX
     assert result.reason == "prior owner judgment"
     assert result.inherited_from == "run-prior"
+    assert result.blank_reason == blank_reason
+
+
+@pytest.mark.parametrize(
+    ("source_digest", "blank_reason"),
+    [
+        ("2" * 64, "content_changed"),
+        (None, "content_digest_unknown"),
+    ],
+)
+def test_inheritance_matcher_requires_equal_known_body_digest_for_exact_carry(
+    source_digest: str | None,
+    blank_reason: str,
+) -> None:
+    merged, outcome = _one_finding_merge()
+    group = merged.groups[0]
+
+    result = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id=group.key,
+                rule_id=group.rule_id,
+                file=group.file,
+                hunk_sha256="1" * 64,
+                body_sha256=source_digest,
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+        current_hunk_sha256={group.key: "1" * 64},
+    )[group.key]
+
+    assert result.tier is InheritanceTier.UNIQUE_PAIR
+    assert result.decision is DispositionDecision.MUST_FIX
     assert result.blank_reason == blank_reason
 
 
@@ -564,11 +606,14 @@ def test_inheritance_matcher_leaves_ambiguous_pairs_blank(duplicate_side: str) -
         unresolved=[],
         coerced_rejections=0,
     )
+    exact_group = merged.groups[0]
     inherited = [
         _inherited_finding(
-            finding_id="prior-1",
+            finding_id=exact_group.key,
             rule_id="rule/actionable",
             file="src/a.py",
+            hunk_sha256="1" * 64,
+            body_sha256=hashlib.sha256(exact_group.bodies[0].encode()).hexdigest(),
         )
     ]
     if duplicate_side == "inherited":
@@ -587,6 +632,7 @@ def test_inheritance_matcher_leaves_ambiguous_pairs_blank(duplicate_side: str) -
         merged,
         outcome,
         inherited_run_id="run-prior",
+        current_hunk_sha256={group.key: "1" * 64 for group in merged.groups},
     )
 
     assert results
@@ -704,6 +750,69 @@ def test_gate_verdict_persists_hunk_content_digest_without_changing_finding_id()
 
     assert verdict.findings[0].finding_id == group.key
     assert verdict.findings[0].hunk_sha256 == HUNK_SHA256
+    assert verdict.findings[0].body_sha256 == BODY_SHA256
+
+
+def test_gate_verdict_persists_per_finding_inheritance_outcome() -> None:
+    merged, outcome = _one_finding_merge()
+    group = merged.groups[0]
+    matches = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id="moved-id",
+                rule_id=group.rule_id,
+                file=group.file,
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+    )
+    document = DispositionDocument(
+        schema_version=1,
+        dispositions=[
+            DispositionRecord(
+                finding_id=group.key,
+                decision=DispositionDecision.ACCEPTED,
+                reason="consciously re-accepted",
+                inherited_from="run-prior",
+            )
+        ],
+    )
+
+    verdict = build_gate_verdict(
+        run_id="run-1",
+        target=target(),
+        coverage=complete_coverage(),
+        merged=merged,
+        outcome=outcome,
+        dispositions=document,
+        inherited_run_id="run-prior",
+        inheritance=matches,
+    )
+
+    assert verdict.findings[0].inheritance_tier is InheritanceTier.UNIQUE_PAIR
+    assert verdict.findings[0].inheritance_blank_reason == "finding_id_changed"
+
+
+def test_inheritance_summary_reason_keys_use_closed_vocabulary() -> None:
+    summary = InheritanceSummary(
+        source_run_id="run-prior",
+        carried=0,
+        prefilled=0,
+        blank=1,
+        reasons={InheritanceBlankReason.UNMATCHED: 1},
+    )
+
+    assert summary.model_dump(mode="json")["reasons"] == {"unmatched": 1}
+    with pytest.raises(ValidationError, match="Input should be"):
+        InheritanceSummary(
+            source_run_id="run-prior",
+            carried=0,
+            prefilled=0,
+            blank=1,
+            reasons={"invented_reason": 1},  # ty: ignore[invalid-argument-type]
+        )
 
 
 def test_disposition_template_does_not_include_rejected_findings(tmp_path: Path) -> None:
@@ -729,6 +838,7 @@ def test_disposition_template_renders_carried_prefilled_and_blank_entries(
             file="src/a.py",
             reason="exact acceptance",
             hunk_sha256="1" * 64,
+            body_sha256=hashlib.sha256(b"blocker").hexdigest(),
         ),
         _inherited_finding(
             finding_id="moved-finding-id",
