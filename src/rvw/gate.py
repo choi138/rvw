@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -63,6 +63,7 @@ class DispositionRecord(BaseModel):
     finding_id: str
     decision: DispositionDecision
     reason: str
+    inherited_from: str | None = None
 
     @field_validator("reason")
     @classmethod
@@ -90,6 +91,24 @@ class GateFinding(BaseModel):
     verdict: Verdict
     disposition: DispositionDecision
     reason: str
+    inherited_from: str | None = None
+
+
+class InheritanceTier(StrEnum):
+    EXACT_ID = "exact_id"
+    UNIQUE_PAIR = "unique_pair"
+
+
+class DispositionInheritance(BaseModel):
+    """Generated inheritance state for one current actionable finding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_id: str
+    decision: DispositionDecision = DispositionDecision.MUST_FIX
+    reason: str = ""
+    inherited_from: str | None = None
+    tier: InheritanceTier | None = None
 
 
 class GateVerdict(BaseModel):
@@ -235,6 +254,59 @@ def _dispositions_by_id(
     return {record.finding_id: record for record in document.dispositions}
 
 
+def match_inherited_dispositions(
+    inherited_findings: Sequence[GateFinding],
+    merged: MergeResult,
+    outcome: AdjudicationOutcome,
+    *,
+    inherited_run_id: str,
+) -> dict[str, DispositionInheritance]:
+    """Match validated prior findings to the current actionable finding set."""
+
+    actionable = [group for group, _ in _actionable(merged, outcome)]
+    results = {group.key: DispositionInheritance(finding_id=group.key) for group in actionable}
+    accepted_by_id = {
+        finding.finding_id: finding
+        for finding in inherited_findings
+        if finding.disposition is DispositionDecision.ACCEPTED
+    }
+    inherited_pair_counts = Counter(
+        (finding.file, finding.rule_id) for finding in inherited_findings
+    )
+    current_pair_counts = Counter((group.file, group.rule_id) for group in actionable)
+    inherited_by_pair = {
+        (finding.file, finding.rule_id): finding
+        for finding in inherited_findings
+        if finding.disposition is DispositionDecision.ACCEPTED
+    }
+
+    for group in actionable:
+        if inherited := accepted_by_id.get(group.key):
+            results[group.key] = DispositionInheritance(
+                finding_id=group.key,
+                decision=DispositionDecision.ACCEPTED,
+                reason=inherited.reason,
+                inherited_from=inherited_run_id,
+                tier=InheritanceTier.EXACT_ID,
+            )
+            continue
+
+        pair = (group.file, group.rule_id)
+        if inherited_pair_counts[pair] != 1 or current_pair_counts[pair] != 1:
+            continue
+        inherited = inherited_by_pair.get(pair)
+        if inherited is None:
+            continue
+        results[group.key] = DispositionInheritance(
+            finding_id=group.key,
+            decision=DispositionDecision.MUST_FIX,
+            reason=inherited.reason,
+            inherited_from=inherited_run_id,
+            tier=InheritanceTier.UNIQUE_PAIR,
+        )
+    return results
+
+
 def build_gate_verdict(
     *,
     run_id: str,
@@ -275,6 +347,7 @@ def build_gate_verdict(
                 verdict=verdict,
                 disposition=record.decision,
                 reason=record.reason,
+                inherited_from=record.inherited_from,
             )
         )
 
@@ -308,18 +381,30 @@ def requires_owner_authorization(
 
 
 def write_disposition_template(
-    run_dir: Path, merged: MergeResult, outcome: AdjudicationOutcome
+    run_dir: Path,
+    merged: MergeResult,
+    outcome: AdjudicationOutcome,
+    *,
+    inheritance: Mapping[str, DispositionInheritance] | None = None,
 ) -> Path:
+    records: list[dict[str, str]] = []
+    for group, _ in _actionable(merged, outcome):
+        matched = inheritance.get(group.key) if inheritance is not None else None
+        record = {
+            "finding_id": group.key,
+            "decision": (
+                matched.decision.value
+                if matched is not None
+                else DispositionDecision.MUST_FIX.value
+            ),
+            "reason": matched.reason if matched is not None else "",
+        }
+        if matched is not None and matched.inherited_from is not None:
+            record["inherited_from"] = matched.inherited_from
+        records.append(record)
     template = {
         "schema_version": 1,
-        "dispositions": [
-            {
-                "finding_id": group.key,
-                "decision": DispositionDecision.MUST_FIX.value,
-                "reason": "",
-            }
-            for group, _ in _actionable(merged, outcome)
-        ],
+        "dispositions": records,
     }
     path = run_dir / "gate-dispositions.yaml"
     path.write_text(
@@ -365,19 +450,21 @@ def render_gate_verdict(verdict: GateVerdict) -> str:
             "",
             "## Gate findings",
             "",
-            "| Finding ID | Severity | Verdict | Disposition | Reason |",
-            "| --- | --- | --- | --- | --- |",
+            "| Finding ID | Severity | Verdict | Disposition | Inherited from | Reason |",
+            "| --- | --- | --- | --- | --- | --- |",
         ]
     )
     lines.extend(
         (
             f"| `{item.finding_id}` | {item.severity.value} | {item.verdict.value} | "
-            f"{item.disposition.value} | {_cell(item.reason)} |"
+            f"{item.disposition.value} | "
+            f"{f'`{_cell(item.inherited_from)}`' if item.inherited_from else '—'} | "
+            f"{_cell(item.reason)} |"
         )
         for item in verdict.findings
     )
     if not verdict.findings:
-        lines.append("| — | — | — | — | No actionable findings |")
+        lines.append("| — | — | — | — | — | No actionable findings |")
     if verdict.actor is not None:
         lines.extend(["", f"Verified blocker-acceptance actor: `{verdict.actor}`"])
     if verdict.failures:
@@ -486,17 +573,20 @@ def provision_checkout(
 __all__ = [
     "DispositionDecision",
     "DispositionDocument",
+    "DispositionInheritance",
     "DispositionRecord",
     "GateAnchor",
     "GateFinding",
     "GateInvariantError",
     "GatePlan",
     "GateVerdict",
+    "InheritanceTier",
     "PullRequestState",
     "build_gate_verdict",
     "github_actor_permission",
     "load_dispositions",
     "load_gate_plan",
+    "match_inherited_dispositions",
     "provision_checkout",
     "query_pull_request",
     "render_gate_verdict",

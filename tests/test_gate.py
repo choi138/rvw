@@ -14,13 +14,16 @@ from rvw.gate import (
     DispositionDocument,
     DispositionRecord,
     GateAnchor,
+    GateFinding,
     GateInvariantError,
     GatePlan,
+    InheritanceTier,
     PullRequestState,
     build_gate_verdict,
     github_actor_permission,
     load_dispositions,
     load_gate_plan,
+    match_inherited_dispositions,
     provision_checkout,
     query_pull_request,
     render_gate_verdict,
@@ -323,6 +326,225 @@ def test_dispositions_require_nonblank_reason_and_strict_shape(tmp_path: Path) -
         load_dispositions(path)
 
 
+def test_disposition_inherited_from_is_optional_strict_and_round_trips(
+    tmp_path: Path,
+) -> None:
+    absent = DispositionRecord(
+        finding_id="finding-1",
+        decision=DispositionDecision.ACCEPTED,
+        reason="fresh judgment",
+    )
+    assert absent.inherited_from is None
+
+    path = tmp_path / "dispositions.yaml"
+    path.write_text(
+        "schema_version: 1\ndispositions:\n"
+        "  - finding_id: finding-1\n"
+        "    decision: accepted\n"
+        "    reason: prior owner judgment\n"
+        "    inherited_from: run-prior\n",
+        encoding="utf-8",
+    )
+    loaded = load_dispositions(path)
+    assert loaded.dispositions[0].inherited_from == "run-prior"
+    assert loaded.model_dump(mode="json")["dispositions"][0]["inherited_from"] == "run-prior"
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        DispositionRecord.model_validate(
+            {
+                "finding_id": "finding-1",
+                "decision": "accepted",
+                "reason": "owner judgment",
+                "inherited_from": "run-prior",
+                "forged": True,
+            }
+        )
+
+
+def _inherited_finding(
+    *,
+    finding_id: str,
+    rule_id: str,
+    file: str,
+    decision: DispositionDecision = DispositionDecision.ACCEPTED,
+    reason: str = "prior owner judgment",
+) -> GateFinding:
+    return GateFinding(
+        finding_id=finding_id,
+        rule_id=rule_id,
+        file=file,
+        line=1,
+        severity=Severity.WARNING,
+        verdict=Verdict.CONFIRMED,
+        disposition=decision,
+        reason=reason,
+    )
+
+
+def _one_finding_merge(
+    *, hunk_id: str = "src/a.py@@-1+1@@", verdict: Verdict = Verdict.CONFIRMED
+) -> tuple[MergeResult, AdjudicationOutcome]:
+    finding = EnrichedFinding(
+        rule_id="rule/actionable",
+        file="src/a.py",
+        hunk_id=hunk_id,
+        line=1,
+        severity=Severity.WARNING,
+        body="actionable",
+        anchorable=True,
+        lane_id="lane-a",
+        replica=1,
+    )
+    merged = merge([finding], lane_tiers={"lane-a": Tier.BASE})
+    key = merged.groups[0].key
+    outcome = AdjudicationOutcome(
+        verdicts={key: verdict},
+        reasons={key: verdict.value.lower()},
+        evidence={key: "evidence"},
+        replica_votes={key: [verdict] * 3},
+        unresolved=[],
+        coerced_rejections=0,
+    )
+    return merged, outcome
+
+
+def test_inheritance_matcher_exact_id_carries_and_unique_pair_prefills() -> None:
+    merged, outcome = _one_finding_merge()
+    group = merged.groups[0]
+
+    exact = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id=group.key,
+                rule_id=group.rule_id,
+                file=group.file,
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+    )[group.key]
+    assert exact.tier is InheritanceTier.EXACT_ID
+    assert exact.decision is DispositionDecision.ACCEPTED
+    assert exact.reason == "prior owner judgment"
+    assert exact.inherited_from == "run-prior"
+
+    moved = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id="different-id",
+                rule_id=group.rule_id,
+                file=group.file,
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+    )[group.key]
+    assert moved.tier is InheritanceTier.UNIQUE_PAIR
+    assert moved.decision is DispositionDecision.MUST_FIX
+    assert moved.reason == "prior owner judgment"
+    assert moved.inherited_from == "run-prior"
+
+
+def test_inheritance_matcher_ignores_must_fix_and_rejected_groups() -> None:
+    merged, outcome = _one_finding_merge()
+    group = merged.groups[0]
+    result = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id=group.key,
+                rule_id=group.rule_id,
+                file=group.file,
+                decision=DispositionDecision.MUST_FIX,
+                reason="still must fix",
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+    )[group.key]
+    assert result.tier is None
+    assert result.decision is DispositionDecision.MUST_FIX
+    assert result.reason == ""
+    assert result.inherited_from is None
+
+    rejected_merged, rejected_outcome = _one_finding_merge(verdict=Verdict.REJECTED)
+    assert (
+        match_inherited_dispositions(
+            [
+                _inherited_finding(
+                    finding_id=rejected_merged.groups[0].key,
+                    rule_id="rule/actionable",
+                    file="src/a.py",
+                )
+            ],
+            rejected_merged,
+            rejected_outcome,
+            inherited_run_id="run-prior",
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize("duplicate_side", ["inherited", "current"])
+def test_inheritance_matcher_leaves_ambiguous_pairs_blank(duplicate_side: str) -> None:
+    findings = [
+        EnrichedFinding(
+            rule_id="rule/actionable",
+            file="src/a.py",
+            hunk_id="src/a.py@@-1+1@@",
+            line=1,
+            severity=Severity.WARNING,
+            body="first",
+            anchorable=True,
+            lane_id="lane-a",
+            replica=1,
+        )
+    ]
+    if duplicate_side == "current":
+        findings.append(
+            findings[0].model_copy(
+                update={"hunk_id": "src/a.py@@-10+10@@", "line": 10, "body": "second"}
+            )
+        )
+    merged = merge(findings, lane_tiers={"lane-a": Tier.BASE})
+    outcome = AdjudicationOutcome(
+        verdicts={group.key: Verdict.CONFIRMED for group in merged.groups},
+        reasons={group.key: "confirmed" for group in merged.groups},
+        evidence={group.key: "evidence" for group in merged.groups},
+        replica_votes={group.key: [Verdict.CONFIRMED] * 3 for group in merged.groups},
+        unresolved=[],
+        coerced_rejections=0,
+    )
+    inherited = [
+        _inherited_finding(
+            finding_id="prior-1",
+            rule_id="rule/actionable",
+            file="src/a.py",
+        )
+    ]
+    if duplicate_side == "inherited":
+        inherited.append(
+            _inherited_finding(
+                finding_id="prior-2",
+                rule_id="rule/actionable",
+                file="src/a.py",
+            )
+        )
+
+    results = match_inherited_dispositions(
+        inherited,
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+    )
+
+    assert results
+    assert all(result.tier is None for result in results.values())
+    assert all(result.reason == "" for result in results.values())
+
+
 def test_owner_only_blocker_acceptance_and_must_fix_verdict() -> None:
     merged, outcome = merged_outcome()
     document = dispositions(merged)
@@ -370,6 +592,7 @@ def test_gate_artifacts_are_reconstructable_and_template_uses_public_ids(
 ) -> None:
     merged, outcome = merged_outcome()
     document = dispositions(merged)
+    document.dispositions[1].inherited_from = "run-prior"
     verdict = build_gate_verdict(
         run_id="run-1",
         target=target(),
@@ -393,7 +616,10 @@ def test_gate_artifacts_are_reconstructable_and_template_uses_public_ids(
     assert {item["finding_id"] for item in payload["findings"]} == {
         record.finding_id for record in document.dispositions
     }
-    assert "| Finding ID | Severity | Verdict | Disposition | Reason |" in markdown
+    inherited = next(item for item in payload["findings"] if item["inherited_from"] is not None)
+    assert inherited["inherited_from"] == "run-prior"
+    assert "| Finding ID | Severity | Verdict | Disposition | Inherited from | Reason |" in markdown
+    assert "`run-prior`" in markdown
     assert md_path.read_text(encoding="utf-8") == markdown
     template = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     assert {item["finding_id"] for item in template["dispositions"]} == {
@@ -411,6 +637,64 @@ def test_disposition_template_does_not_include_rejected_findings(tmp_path: Path)
     by_rule = {group.rule_id: group.key for group in merged.groups}
 
     assert by_rule["rule/rejected"] not in {item["finding_id"] for item in template["dispositions"]}
+
+
+def test_disposition_template_renders_carried_prefilled_and_blank_entries(
+    tmp_path: Path,
+) -> None:
+    merged, outcome = merged_outcome()
+    by_rule = {group.rule_id: group for group in merged.groups}
+    rejected = by_rule["rule/rejected"]
+    outcome.verdicts[rejected.key] = Verdict.CONFIRMED
+    inherited = [
+        _inherited_finding(
+            finding_id=by_rule["rule/blocker"].key,
+            rule_id="rule/blocker",
+            file="src/a.py",
+            reason="exact acceptance",
+        ),
+        _inherited_finding(
+            finding_id="moved-finding-id",
+            rule_id="rule/uncertain",
+            file="src/b.py",
+            reason="moved acceptance",
+        ),
+    ]
+    matches = match_inherited_dispositions(
+        inherited,
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+    )
+
+    template_path = write_disposition_template(
+        tmp_path,
+        merged,
+        outcome,
+        inheritance=matches,
+    )
+
+    records = {
+        item["finding_id"]: item
+        for item in yaml.safe_load(template_path.read_text(encoding="utf-8"))["dispositions"]
+    }
+    assert records[by_rule["rule/blocker"].key] == {
+        "finding_id": by_rule["rule/blocker"].key,
+        "decision": "accepted",
+        "reason": "exact acceptance",
+        "inherited_from": "run-prior",
+    }
+    assert records[by_rule["rule/uncertain"].key] == {
+        "finding_id": by_rule["rule/uncertain"].key,
+        "decision": "must_fix",
+        "reason": "moved acceptance",
+        "inherited_from": "run-prior",
+    }
+    assert records[rejected.key] == {
+        "finding_id": rejected.key,
+        "decision": "must_fix",
+        "reason": "",
+    }
 
 
 def test_provision_checkout_clones_detaches_and_verifies_head_and_clean(tmp_path: Path) -> None:

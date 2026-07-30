@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rvw.adjudicate import AdjudicationOutcome
 from rvw.diffbudget import DiffBudgetReport
@@ -14,6 +14,9 @@ from rvw.discover import DiscoverResult, EnrichedFinding, LaneCoverage
 from rvw.merge import MergeResult
 from rvw.schema import Verdict
 from rvw.target import ResolvedTarget
+
+if TYPE_CHECKING:
+    from rvw.gate import GateVerdict
 
 
 class RunNotFound(FileNotFoundError):
@@ -130,6 +133,13 @@ class RunHandle:
         if not path.is_file():
             raise StageMissing("report", self.dir)
         return path.read_text(encoding="utf-8")
+
+    def load_gate_verdict(self) -> GateVerdict:
+        from rvw.gate import GateVerdict
+
+        return GateVerdict.model_validate(
+            _load_json(self.dir / "gate-verdict.json", "gate-verdict")
+        )
 
 
 class RunStore:

@@ -29,10 +29,12 @@ from rvw.gate import (
     GateInvariantError,
     GatePlan,
     GateVerdict,
+    InheritanceTier,
     build_gate_verdict,
     github_actor_permission,
     load_dispositions,
     load_gate_plan,
+    match_inherited_dispositions,
     provision_checkout,
     query_pull_request,
     requires_owner_authorization,
@@ -103,6 +105,12 @@ class _PipelineArtifacts:
     outcome: AdjudicationOutcome | None
     report_md: str
     report_path: Path
+
+
+class _InheritanceSourceError(ValueError):
+    def __init__(self, reason: str, detail: str) -> None:
+        self.reason = reason
+        super().__init__(f"{reason}: {detail}")
 
 
 def _write_json(payload: Any) -> None:
@@ -623,6 +631,53 @@ def _load_gate_artifacts(run_id: str, out_root: Path) -> _PipelineArtifacts:
     )
 
 
+def _load_inherited_dispositions(
+    run_id: str,
+    *,
+    current_target: ResolvedTarget,
+    out_root: Path,
+) -> GateVerdict:
+    try:
+        run = RunStore(out_root).open(run_id)
+    except RunNotFound as exc:
+        raise _InheritanceSourceError("inherit_run_missing", str(exc)) from exc
+
+    try:
+        source_target = run.load_target()
+    except StageMissing as exc:
+        raise _InheritanceSourceError("inherit_target_missing", str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise _InheritanceSourceError("inherit_target_invalid", str(exc)) from exc
+
+    current_identity = (current_target.repo, current_target.pr_number)
+    source_identity = (source_target.repo, source_target.pr_number)
+    if source_target.kind != "pr" or source_identity != current_identity:
+        raise _InheritanceSourceError(
+            "inherit_target_mismatch",
+            f"inherited run targets {source_identity[0]}#{source_identity[1]}, "
+            f"current run targets {current_identity[0]}#{current_identity[1]}",
+        )
+
+    try:
+        verdict = run.load_gate_verdict()
+    except StageMissing as exc:
+        raise _InheritanceSourceError("inherit_verdict_missing", str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise _InheritanceSourceError("inherit_verdict_invalid", str(exc)) from exc
+    if verdict.run_id != run_id or (verdict.repo, verdict.pr_number) != source_identity:
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            "gate verdict identity does not match its persisted run target",
+        )
+    return verdict.model_copy(
+        update={
+            "findings": [
+                finding for finding in verdict.findings if finding.disposition.value == "accepted"
+            ]
+        }
+    )
+
+
 def _gate_failure_verdict(artifacts: _PipelineArtifacts, message: str) -> GateVerdict:
     target = artifacts.target
     if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
@@ -651,6 +706,7 @@ def gate(
     target: Annotated[str | None, Option("--target")] = None,
     run_id: Annotated[str | None, Option("--run")] = None,
     dispositions_path: Annotated[Path | None, Option("--dispositions")] = None,
+    inherit_run_id: Annotated[str | None, Option("--inherit")] = None,
     registry_root: Annotated[
         Path, Option("--registry", help="Registry root containing layers.yaml and lanes/.")
     ] = DEFAULT_REGISTRY_ROOT,
@@ -669,6 +725,7 @@ def gate(
             target_spec=target,
             run_id=run_id,
             dispositions_path=dispositions_path,
+            inherit_run_id=inherit_run_id,
             registry_root=registry_root,
             replicas=replicas,
             out_root=out_root,
@@ -683,6 +740,7 @@ async def _gate_pipeline(
     target_spec: str | None,
     run_id: str | None,
     dispositions_path: Path | None,
+    inherit_run_id: str | None,
     registry_root: Path,
     replicas: int,
     out_root: Path,
@@ -691,6 +749,7 @@ async def _gate_pipeline(
 ) -> None:
     artifacts: _PipelineArtifacts
     plan: GatePlan
+    inherited_verdict: GateVerdict | None = None
     if target_spec is not None:
         try:
             resolved = _resolve_cli_target(target_spec)
@@ -701,6 +760,16 @@ async def _gate_pipeline(
             if resolved.kind != "pr" or resolved.pr_number is None or resolved.base_sha is None:
                 _error_console.print("rvw gate requires a PR target", markup=False)
                 raise typer.Exit(EXIT_USER_ERROR)
+            if inherit_run_id is not None:
+                try:
+                    inherited_verdict = _load_inherited_dispositions(
+                        inherit_run_id,
+                        current_target=resolved,
+                        out_root=out_root,
+                    )
+                except _InheritanceSourceError as exc:
+                    _error_console.print(str(exc), markup=False)
+                    raise typer.Exit(EXIT_USER_ERROR) from exc
             plan = _gate_plan(registry_root, resolved, replicas)
             with tempfile.TemporaryDirectory(prefix="rvw-gate-") as temporary_root:
                 checkout = provision_checkout(
@@ -746,6 +815,16 @@ async def _gate_pipeline(
     if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
         _error_console.print("rvw gate requires persisted PR artifacts", markup=False)
         raise typer.Exit(EXIT_USER_ERROR)
+    if inherit_run_id is not None and inherited_verdict is None:
+        try:
+            inherited_verdict = _load_inherited_dispositions(
+                inherit_run_id,
+                current_target=target,
+                out_root=out_root,
+            )
+        except _InheritanceSourceError as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_USER_ERROR) from exc
     anchor = GateAnchor(base_sha=target.base_sha, head_sha=target.head_sha)
     try:
         current = query_pull_request(target.repo, target.pr_number)
@@ -767,11 +846,30 @@ async def _gate_pipeline(
     outcome = cast(AdjudicationOutcome, artifacts.outcome)
 
     if dispositions_path is None:
-        template_path = write_disposition_template(artifacts.run.dir, artifacts.merged, outcome)
-        if any(
+        inheritance = (
+            match_inherited_dispositions(
+                inherited_verdict.findings,
+                artifacts.merged,
+                outcome,
+                inherited_run_id=inherit_run_id,
+            )
+            if inherited_verdict is not None and inherit_run_id is not None
+            else None
+        )
+        template_path = write_disposition_template(
+            artifacts.run.dir,
+            artifacts.merged,
+            outcome,
+            inheritance=inheritance,
+        )
+        has_actionable = any(
             verdict in {Verdict.CONFIRMED, Verdict.UNCERTAIN}
             for verdict in outcome.verdicts.values()
-        ):
+        )
+        fully_inherited = inheritance is not None and all(
+            matched.tier is InheritanceTier.EXACT_ID for matched in inheritance.values()
+        )
+        if has_actionable and not fully_inherited:
             save_gate_verdict(
                 artifacts.run.dir,
                 _gate_failure_verdict(
@@ -781,12 +879,16 @@ async def _gate_pipeline(
             _console.print(
                 "actionable findings require dispositions — edit "
                 f"{template_path} then resume: rvw gate --run {artifacts.run.run_id} "
-                f"--dispositions {template_path}",
+                f"--dispositions {template_path}"
+                + (f" --inherit {inherit_run_id}" if inherit_run_id is not None else ""),
                 markup=False,
                 soft_wrap=True,
             )
             raise typer.Exit(EXIT_NOT_FOUND)
-        dispositions = DispositionDocument(schema_version=1, dispositions=[])
+        if has_actionable:
+            dispositions = load_dispositions(template_path)
+        else:
+            dispositions = DispositionDocument(schema_version=1, dispositions=[])
     else:
         try:
             dispositions = load_dispositions(dispositions_path)

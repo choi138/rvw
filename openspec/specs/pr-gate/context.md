@@ -11,6 +11,11 @@ This capability replaces a prose-and-copy-paste PR gate sequence with one artifa
 - The repository-admin permission returned by GitHub is the verifiable owner authority for blocker acceptance. rvw records that actor and the human reason but does not decide or publish an approval.
 - `accepted` and `must_fix` are deliberately small disposition states. The latter keeps the gate blocked; the former records explicit risk acceptance subject to blocker authority.
 - Gate publication reuses the ordinary publish implementation, so COMMENT hardcoding, dry-run default, inline selection, and the bounded bulk 422 fallback have one code path.
+- Six tabelog PR #27 rounds (runs 051207 through 111704 on 2026-07-29) did not converge because every changed-head review forgot prior owner dispositions. Round 5 contained 55 actionable findings, about 45 of which were accepted re-detections or re-critiques of the immediately preceding fixes. Carrying validated acceptances is therefore a convergence mechanism, not merely a template convenience.
+- Runs 105629 and 111704 both reviewed head `f9936ad`. An unchanged head uses the existing artifact-backed resume path and MUST NOT be re-targeted for a fresh review; re-targeting an identical head is operator error. A changed head starts a new target run and may inherit from the prior run's validated verdict.
+- The persisted gate verdict is the inheritance source because its dispositions have already passed exact-ID, completeness, duplicate, unknown-ID, and owner checks. BLOCK verdicts remain useful sources for their accepted records; their `must_fix` records never carry.
+- In target mode, `--inherit` source validation follows PR target resolution and precedes checkout provisioning and review execution.
+- Exact finding IDs include diff coordinates, so an unchanged ID can auto-carry while a unique `(file, rule_id)` match only prefills the reason for conscious re-acceptance. Duplicate pairs on either side deliberately under-carry.
 
 ## Constraints
 
@@ -19,6 +24,7 @@ This capability replaces a prose-and-copy-paste PR gate sequence with one artifa
 - Finding IDs include hunk identity and are valid only while both persisted anchors remain current.
 - Resume requires the ordinary run stages and `gate-plan.json` written by target mode.
 - A coverage failure identifies the missing, unexpected, or invalid replica-chunk identity from persisted artifacts.
+- Inheritance is limited to persisted verdicts for the same repository and pull-request number. Base and head anchors may differ between the source and inheriting runs.
 
 ## Failure modes
 
@@ -37,6 +43,18 @@ rvw gate --run <run-id> \
 ```
 
 The first command reviews once and exits 1 when actionable findings need dispositions. The second command revalidates the PR anchors and saved coverage, produces `gate-verdict.json` and `gate-verdict.md`, and writes a dry-run COMMENT payload without repeating review.
+
+For a changed head, inherit the previous run's accepted dispositions while creating the new run:
+
+```bash
+rvw gate --target 1134 --inherit <prior-run-id>
+# if the generated template contains prefilled or blank records, edit it and resume
+rvw gate --run <new-run-id> \
+  --dispositions /tmp/rvw/<new-run-id>/gate-dispositions.yaml \
+  --inherit <prior-run-id>
+```
+
+If the pull request head still equals an existing run's captured head, resume that run instead: `rvw gate --run <existing-run-id>`. Never use `--target` to repeat review at an unchanged head.
 
 ## Historical deltas
 
