@@ -118,6 +118,23 @@ def test_open_unknown_run_raises(tmp_path: Path) -> None:
         RunStore(tmp_path).open("missing-run")
 
 
+@pytest.mark.parametrize("run_id", [".", "..", "nested/run"])
+def test_open_rejects_non_child_run_ids_before_lookup(tmp_path: Path, run_id: str) -> None:
+    with pytest.raises(ValueError, match="invalid run ID"):
+        RunStore(tmp_path).open(run_id)
+
+
+def test_open_rejects_symlinked_run_directory(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "linked-run").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="invalid run ID"):
+        RunStore(root).open("linked-run")
+
+
 def test_missing_stage_names_stage_and_directory(tmp_path: Path) -> None:
     run = RunStore(tmp_path).create(target_fixture())
 

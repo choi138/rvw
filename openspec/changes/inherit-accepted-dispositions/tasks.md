@@ -20,3 +20,23 @@
 - [x] 4.1 Synchronize the pr-gate main spec with the implemented contract and record the six-round non-convergence evidence in `context.md`.
 - [x] 4.2 Document the unchanged-head rule (resume, never re-target) and the changed-head `--inherit` workflow in the pr-gate context.
 - [x] 4.3 Run all bare gates and `openspec validate --specs`.
+
+## 5. Fail-closed matching hardening
+
+- [x] 5.1 Add failing tests for mixed accepted/must-fix source ambiguity, content-digest tier-one matching, changed and unknown digests, and per-entry blank reasons.
+- [x] 5.2 Implement all-finding ambiguity counting, optional persisted `hunk_sha256`, digest-bound tier one, typed disposition comparisons, and blank-reason template comments.
+
+## 6. Source and provenance integrity
+
+- [x] 6.1 Add failing tests for traversal and symlink run IDs plus unbound, mismatched, and unmatched `inherited_from` claims.
+- [x] 6.2 Harden `RunStore.open` containment and validate provenance against a matcher result recomputed from the selected inheritance source.
+
+## 7. Inheritance failure diagnostics
+
+- [x] 7.1 Add failing tests for console and persisted inheritance outcome summaries and actor-, permission-, and finding-specific blocker authorization failures.
+- [x] 7.2 Persist and render inheritance outcome summaries and detailed blocker re-verification failures.
+
+## 8. Remediation specification and verification
+
+- [x] 8.1 Synchronize the delta and main pr-gate spec/context with the hardened contract.
+- [x] 8.2 Run the focused regressions, all bare repository gates, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.

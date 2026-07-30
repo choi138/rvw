@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -37,6 +38,10 @@ from rvw.merge import MergeResult, merge
 from rvw.report import render_report
 from rvw.schema import Severity, Tier, Verdict
 from rvw.target import ResolvedTarget
+
+HUNK_TEXT = "@@ -1 +1 @@\n-old\n+new\n"
+HUNK_DIFF = f"diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n{HUNK_TEXT}"
+HUNK_SHA256 = hashlib.sha256(HUNK_TEXT.encode()).hexdigest()
 
 
 def target() -> ResolvedTarget:
@@ -368,6 +373,7 @@ def _inherited_finding(
     file: str,
     decision: DispositionDecision = DispositionDecision.ACCEPTED,
     reason: str = "prior owner judgment",
+    hunk_sha256: str | None = None,
 ) -> GateFinding:
     return GateFinding(
         finding_id=finding_id,
@@ -378,6 +384,7 @@ def _inherited_finding(
         verdict=Verdict.CONFIRMED,
         disposition=decision,
         reason=reason,
+        hunk_sha256=hunk_sha256,
     )
 
 
@@ -418,11 +425,13 @@ def test_inheritance_matcher_exact_id_carries_and_unique_pair_prefills() -> None
                 finding_id=group.key,
                 rule_id=group.rule_id,
                 file=group.file,
+                hunk_sha256="1" * 64,
             )
         ],
         merged,
         outcome,
         inherited_run_id="run-prior",
+        current_hunk_sha256={group.key: "1" * 64},
     )[group.key]
     assert exact.tier is InheritanceTier.EXACT_ID
     assert exact.decision is DispositionDecision.ACCEPTED
@@ -445,6 +454,43 @@ def test_inheritance_matcher_exact_id_carries_and_unique_pair_prefills() -> None
     assert moved.decision is DispositionDecision.MUST_FIX
     assert moved.reason == "prior owner judgment"
     assert moved.inherited_from == "run-prior"
+    assert moved.blank_reason == "finding_id_changed"
+
+
+@pytest.mark.parametrize(
+    ("source_digest", "blank_reason"),
+    [
+        ("2" * 64, "content_changed"),
+        (None, "content_digest_unknown"),
+    ],
+)
+def test_inheritance_matcher_demotes_exact_id_without_equal_known_hunk_digest(
+    source_digest: str | None,
+    blank_reason: str,
+) -> None:
+    merged, outcome = _one_finding_merge()
+    group = merged.groups[0]
+
+    result = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id=group.key,
+                rule_id=group.rule_id,
+                file=group.file,
+                hunk_sha256=source_digest,
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+        current_hunk_sha256={group.key: "1" * 64},
+    )[group.key]
+
+    assert result.tier is InheritanceTier.UNIQUE_PAIR
+    assert result.decision is DispositionDecision.MUST_FIX
+    assert result.reason == "prior owner judgment"
+    assert result.inherited_from == "run-prior"
+    assert result.blank_reason == blank_reason
 
 
 def test_inheritance_matcher_ignores_must_fix_and_rejected_groups() -> None:
@@ -468,6 +514,7 @@ def test_inheritance_matcher_ignores_must_fix_and_rejected_groups() -> None:
     assert result.decision is DispositionDecision.MUST_FIX
     assert result.reason == ""
     assert result.inherited_from is None
+    assert result.blank_reason == "prior_must_fix"
 
     rejected_merged, rejected_outcome = _one_finding_merge(verdict=Verdict.REJECTED)
     assert (
@@ -530,6 +577,8 @@ def test_inheritance_matcher_leaves_ambiguous_pairs_blank(duplicate_side: str) -
                 finding_id="prior-2",
                 rule_id="rule/actionable",
                 file="src/a.py",
+                decision=DispositionDecision.MUST_FIX,
+                reason="still must fix",
             )
         )
 
@@ -543,6 +592,10 @@ def test_inheritance_matcher_leaves_ambiguous_pairs_blank(duplicate_side: str) -
     assert results
     assert all(result.tier is None for result in results.values())
     assert all(result.reason == "" for result in results.values())
+    expected_reason = (
+        "source_pair_ambiguous" if duplicate_side == "inherited" else "current_pair_ambiguous"
+    )
+    assert all(result.blank_reason == expected_reason for result in results.values())
 
 
 def test_owner_only_blocker_acceptance_and_must_fix_verdict() -> None:
@@ -592,7 +645,6 @@ def test_gate_artifacts_are_reconstructable_and_template_uses_public_ids(
 ) -> None:
     merged, outcome = merged_outcome()
     document = dispositions(merged)
-    document.dispositions[1].inherited_from = "run-prior"
     verdict = build_gate_verdict(
         run_id="run-1",
         target=target(),
@@ -616,10 +668,7 @@ def test_gate_artifacts_are_reconstructable_and_template_uses_public_ids(
     assert {item["finding_id"] for item in payload["findings"]} == {
         record.finding_id for record in document.dispositions
     }
-    inherited = next(item for item in payload["findings"] if item["inherited_from"] is not None)
-    assert inherited["inherited_from"] == "run-prior"
     assert "| Finding ID | Severity | Verdict | Disposition | Inherited from | Reason |" in markdown
-    assert "`run-prior`" in markdown
     assert md_path.read_text(encoding="utf-8") == markdown
     template = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     assert {item["finding_id"] for item in template["dispositions"]} == {
@@ -628,6 +677,33 @@ def test_gate_artifacts_are_reconstructable_and_template_uses_public_ids(
     assert {item["reason"] for item in template["dispositions"]} == {""}
     with pytest.raises(ValidationError, match="nonblank"):
         load_dispositions(template_path)
+
+
+def test_gate_verdict_persists_hunk_content_digest_without_changing_finding_id() -> None:
+    merged, outcome = _one_finding_merge(hunk_id="src/a.py@@-1,1+1,1@@")
+    group = merged.groups[0]
+    document = DispositionDocument(
+        schema_version=1,
+        dispositions=[
+            DispositionRecord(
+                finding_id=group.key,
+                decision=DispositionDecision.ACCEPTED,
+                reason="reviewed",
+            )
+        ],
+    )
+
+    verdict = build_gate_verdict(
+        run_id="run-1",
+        target=target().model_copy(update={"diff": HUNK_DIFF}),
+        coverage=complete_coverage(),
+        merged=merged,
+        outcome=outcome,
+        dispositions=document,
+    )
+
+    assert verdict.findings[0].finding_id == group.key
+    assert verdict.findings[0].hunk_sha256 == HUNK_SHA256
 
 
 def test_disposition_template_does_not_include_rejected_findings(tmp_path: Path) -> None:
@@ -652,6 +728,7 @@ def test_disposition_template_renders_carried_prefilled_and_blank_entries(
             rule_id="rule/blocker",
             file="src/a.py",
             reason="exact acceptance",
+            hunk_sha256="1" * 64,
         ),
         _inherited_finding(
             finding_id="moved-finding-id",
@@ -665,6 +742,7 @@ def test_disposition_template_renders_carried_prefilled_and_blank_entries(
         merged,
         outcome,
         inherited_run_id="run-prior",
+        current_hunk_sha256={by_rule["rule/blocker"].key: "1" * 64},
     )
 
     template_path = write_disposition_template(
@@ -695,6 +773,7 @@ def test_disposition_template_renders_carried_prefilled_and_blank_entries(
         "decision": "must_fix",
         "reason": "",
     }
+    assert "# blank_reason: unmatched" in template_path.read_text(encoding="utf-8")
 
 
 def test_provision_checkout_clones_detaches_and_verifies_head_and_clean(tmp_path: Path) -> None:

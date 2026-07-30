@@ -29,6 +29,7 @@ from rvw.gate import (
     GateInvariantError,
     GatePlan,
     GateVerdict,
+    InheritanceSummary,
     InheritanceTier,
     build_gate_verdict,
     github_actor_permission,
@@ -40,10 +41,12 @@ from rvw.gate import (
     requires_owner_authorization,
     save_gate_plan,
     save_gate_verdict,
+    summarize_inheritance,
     validate_coverage,
     verify_pull_request,
     write_disposition_template,
 )
+from rvw.hunks import hunk_sha256_by_id
 from rvw.lane import Lane, load_lane
 from rvw.merge import MergeResult, merge
 from rvw.policy import evaluate, load_policy
@@ -53,7 +56,7 @@ from rvw.report import render_report
 from rvw.runtimes.codex import CodexRuntime
 from rvw.sample import SampleReport, sample_lane
 from rvw.schema import Tier, Verdict, finding_schema, lane_output_schema
-from rvw.store import RunHandle, RunNotFound, RunStore, StageMissing
+from rvw.store import InvalidRunId, RunHandle, RunNotFound, RunStore, StageMissing
 from rvw.target import ResolvedTarget, TargetResolutionError, resolve_target
 
 EXIT_OK = 0
@@ -639,6 +642,8 @@ def _load_inherited_dispositions(
 ) -> GateVerdict:
     try:
         run = RunStore(out_root).open(run_id)
+    except InvalidRunId as exc:
+        raise _InheritanceSourceError("inherit_run_invalid", str(exc)) from exc
     except RunNotFound as exc:
         raise _InheritanceSourceError("inherit_run_missing", str(exc)) from exc
 
@@ -669,16 +674,15 @@ def _load_inherited_dispositions(
             "inherit_verdict_invalid",
             "gate verdict identity does not match its persisted run target",
         )
-    return verdict.model_copy(
-        update={
-            "findings": [
-                finding for finding in verdict.findings if finding.disposition.value == "accepted"
-            ]
-        }
-    )
+    return verdict
 
 
-def _gate_failure_verdict(artifacts: _PipelineArtifacts, message: str) -> GateVerdict:
+def _gate_failure_verdict(
+    artifacts: _PipelineArtifacts,
+    message: str,
+    *,
+    inheritance_summary: InheritanceSummary | None = None,
+) -> GateVerdict:
     target = artifacts.target
     if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
         raise GateInvariantError("gate failure artifact requires a PR target")
@@ -692,11 +696,24 @@ def _gate_failure_verdict(artifacts: _PipelineArtifacts, message: str) -> GateVe
         findings=[],
         verdict="BLOCK",
         failures=[message],
+        inheritance_summary=inheritance_summary,
     )
 
 
-def _gate_invariant_failure(artifacts: _PipelineArtifacts, exc: GateInvariantError) -> None:
-    save_gate_verdict(artifacts.run.dir, _gate_failure_verdict(artifacts, str(exc)))
+def _gate_invariant_failure(
+    artifacts: _PipelineArtifacts,
+    exc: GateInvariantError,
+    *,
+    inheritance_summary: InheritanceSummary | None = None,
+) -> None:
+    save_gate_verdict(
+        artifacts.run.dir,
+        _gate_failure_verdict(
+            artifacts,
+            str(exc),
+            inheritance_summary=inheritance_summary,
+        ),
+    )
     _error_console.print(str(exc), markup=False)
     raise typer.Exit(EXIT_NOT_FOUND) from exc
 
@@ -845,17 +862,28 @@ async def _gate_pipeline(
         _gate_invariant_failure(artifacts, GateInvariantError("adjudication outcome is required"))
     outcome = cast(AdjudicationOutcome, artifacts.outcome)
 
-    if dispositions_path is None:
-        inheritance = (
-            match_inherited_dispositions(
-                inherited_verdict.findings,
-                artifacts.merged,
-                outcome,
-                inherited_run_id=inherit_run_id,
-            )
-            if inherited_verdict is not None and inherit_run_id is not None
-            else None
+    hunk_digests = hunk_sha256_by_id(target.diff)
+    current_hunk_sha256 = {
+        group.key: hunk_digests.get(group.hunk_id) for group in artifacts.merged.groups
+    }
+    inheritance = (
+        match_inherited_dispositions(
+            inherited_verdict.findings,
+            artifacts.merged,
+            outcome,
+            inherited_run_id=inherit_run_id,
+            current_hunk_sha256=current_hunk_sha256,
         )
+        if inherited_verdict is not None and inherit_run_id is not None
+        else None
+    )
+    inheritance_summary = (
+        summarize_inheritance(inheritance, source_run_id=inherit_run_id)
+        if inheritance is not None and inherit_run_id is not None
+        else None
+    )
+
+    if dispositions_path is None:
         template_path = write_disposition_template(
             artifacts.run.dir,
             artifacts.merged,
@@ -873,14 +901,29 @@ async def _gate_pipeline(
             save_gate_verdict(
                 artifacts.run.dir,
                 _gate_failure_verdict(
-                    artifacts, "actionable findings require explicit dispositions"
+                    artifacts,
+                    "actionable findings require explicit dispositions",
+                    inheritance_summary=inheritance_summary,
                 ),
             )
+            summary_text = ""
+            if inheritance_summary is not None:
+                reasons = ",".join(
+                    f"{reason}={count}" for reason, count in inheritance_summary.reasons.items()
+                )
+                summary_text = (
+                    f"; inheritance source={inheritance_summary.source_run_id} "
+                    f"carried={inheritance_summary.carried} "
+                    f"prefilled={inheritance_summary.prefilled} "
+                    f"blank={inheritance_summary.blank}"
+                    + (f" reasons={reasons}" if reasons else "")
+                )
             _console.print(
                 "actionable findings require dispositions — edit "
                 f"{template_path} then resume: rvw gate --run {artifacts.run.run_id} "
                 f"--dispositions {template_path}"
                 + (f" --inherit {inherit_run_id}" if inherit_run_id is not None else ""),
+                summary_text,
                 markup=False,
                 soft_wrap=True,
             )
@@ -899,7 +942,13 @@ async def _gate_pipeline(
     actor: str | None = None
     permission: str | None = None
     try:
-        if requires_owner_authorization(artifacts.merged, outcome, dispositions):
+        if requires_owner_authorization(
+            artifacts.merged,
+            outcome,
+            dispositions,
+            inherited_run_id=inherit_run_id,
+            inheritance=inheritance,
+        ):
             actor, permission = github_actor_permission(target.repo)
         verdict = build_gate_verdict(
             run_id=artifacts.run.run_id,
@@ -910,9 +959,16 @@ async def _gate_pipeline(
             dispositions=dispositions,
             actor=actor,
             actor_permission=permission,
+            inherited_run_id=inherit_run_id,
+            inheritance=inheritance,
+            inheritance_summary=inheritance_summary,
         )
     except GateInvariantError as exc:
-        _gate_invariant_failure(artifacts, exc)
+        _gate_invariant_failure(
+            artifacts,
+            exc,
+            inheritance_summary=inheritance_summary,
+        )
     except (OSError, subprocess.CalledProcessError, ValueError) as exc:
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_SYSTEM_ERROR) from exc

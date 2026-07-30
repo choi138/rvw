@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,15 @@ class RunNotFound(FileNotFoundError):
         self.run_id = run_id
         self.root = root
         super().__init__(f"run not found: {run_id} under {root}")
+
+
+class InvalidRunId(ValueError):
+    """A run identifier is not a safe direct child of the artifact root."""
+
+    def __init__(self, run_id: str, root: Path) -> None:
+        self.run_id = run_id
+        self.root = root
+        super().__init__(f"invalid run ID: {run_id!r} under {root}")
 
 
 class StageMissing(FileNotFoundError):
@@ -165,12 +175,19 @@ class RunStore:
         return RunHandle(run_id=run_id, dir=run_dir)
 
     def open(self, run_id: str) -> RunHandle:
-        if Path(run_id).name != run_id:
-            raise RunNotFound(run_id, self.root)
+        separators = tuple(item for item in (os.sep, os.altsep) if item is not None)
+        if not run_id or run_id in {".", ".."} or any(item in run_id for item in separators):
+            raise InvalidRunId(run_id, self.root)
         run_dir = self.root / run_id
+        if run_dir.is_symlink():
+            raise InvalidRunId(run_id, self.root)
+        resolved_root = self.root.resolve()
+        resolved_run = run_dir.resolve()
+        if not resolved_run.is_relative_to(resolved_root) or resolved_run == resolved_root:
+            raise InvalidRunId(run_id, self.root)
         if not run_dir.is_dir():
             raise RunNotFound(run_id, self.root)
         return RunHandle(run_id=run_id, dir=run_dir)
 
 
-__all__ = ["RunHandle", "RunNotFound", "RunStore", "StageMissing"]
+__all__ = ["InvalidRunId", "RunHandle", "RunNotFound", "RunStore", "StageMissing"]

@@ -30,22 +30,22 @@ Six gate rounds on tabelog PR #27 (runs 051207 → 111704, 2026-07-29) surfaced 
 
 The public finding ID is `sha1(file:hunk_id:rule_id)` and `hunk_id` embeds unified-diff line coordinates, so any push that shifts lines re-keys every downstream finding. Matching therefore runs in two tiers:
 
-- **Tier 1 — exact ID match** (same file, same hunk coordinates, same rule): the finding is byte-identical in identity terms; the accepted decision and reason auto-carry, stamped `inherited_from: <run-id>`.
-- **Tier 2 — unique `(file, rule_id)` match**: the same rule fired in the same file but the hunk moved. The prior reason is prefilled into the template (with `inherited_from`) but the decision stays `must_fix`, so a human must consciously flip it. If either side has more than one finding for that `(file, rule_id)` pair, the pair is ambiguous and nothing carries (blank entry, as today).
+- **Tier 1 — exact ID plus hunk-content match**: the public ID and the persisted SHA-256 digest of the run's own unified-diff hunk text must both match. The accepted decision and reason then auto-carry, stamped `inherited_from: <run-id>`. A missing legacy digest or a digest mismatch demotes the finding to tier 2 because coordinate identity alone is not evidence of equal content.
+- **Tier 2 — unique `(file, rule_id)` match**: the same rule fired in the same file but the hunk moved or tier-one content proof is unavailable. The prior reason is prefilled into the template (with `inherited_from`) but the decision stays `must_fix`, so a human must consciously flip it. Pair multiplicity is counted over all inherited verdict findings, including `must_fix`, and all current actionable findings. If either side has more than one finding for that pair, the pair is ambiguous and nothing carries.
 
 Under-carrying is always safe (worst case: today's behavior). Over-carrying would silently launder a stale acceptance onto a semantically different finding, so tier 2 never auto-accepts.
 
 ### D3. Auto-proceed only on full tier-1 coverage
 
-If and only if every actionable finding of the new run received a tier-1 carried acceptance, gate writes the generated document to the run directory and continues into validation in the same invocation. Any tier-2 prefill, blank entry, or prior `must_fix` keeps today's pause-and-resume flow. The persisted document keeps the verdict reconstructable from artifacts alone.
+If and only if every actionable finding of the new run received a digest-verified tier-1 carried acceptance, gate writes the generated document to the run directory and continues into validation in the same invocation. Any tier-2 prefill, blank entry, or prior `must_fix` keeps today's pause-and-resume flow. Partial runs persist a structured outcome summary and render machine-readable reasons as template comments so under-carry is reconstructable without rerunning the matcher.
 
 ### D4. Provenance is part of the strict schema
 
-`DispositionRecord` gains an optional `inherited_from: str | None` (default `None`, `extra="forbid"` retained). It appears in generated templates for carried/prefilled records, is preserved through validation, and is rendered in the verdict artifact so a reviewer can distinguish fresh owner judgment from carried judgment. Existing disposition documents without the field remain valid.
+`DispositionRecord` gains an optional `inherited_from: str | None` (default `None`, `extra="forbid"` retained). It appears in generated templates for carried/prefilled records, is preserved through validation, and is rendered in the verdict artifact so a reviewer can distinguish fresh owner judgment from carried judgment. Validation recomputes matching from the selected source and rejects provenance that names another run, has no selected source, or is attached to an outcome the matcher did not carry or prefill. Existing disposition documents without the field remain valid.
 
 ### D5. Owner authorization is re-verified per run
 
-Carried accepted blockers still pass through `requires_owner_authorization` → `github_actor_permission` on the new run. Inheritance moves reason text, never authorization: the actor executing the inheriting run is re-verified as admin at validation time.
+Carried accepted blockers still pass through `requires_owner_authorization` → `github_actor_permission` on the new run. Inheritance moves reason text, never authorization: the actor executing the inheriting run is re-verified as admin at validation time. A failed check records the blocker finding ID and the observed actor and permission rather than collapsing to a generic invariant.
 
 ### D6. Same-head reuse is resume, not a new flag
 
@@ -53,7 +53,7 @@ No `--reuse` option. The pr-gate spec already mandates resume-without-re-review 
 
 ## Risks / Trade-offs
 
-- **Line-shift fragility of tier 1**: pushes that only shift lines demote carries to tier 2 (human re-confirm). Accepted for now; the durable fix is content-hash hunk anchoring, listed as future work because it re-keys all published finding IDs.
+- **Line-shift fragility of tier 1**: pushes that only shift lines still demote carries to tier 2 (human re-confirm). Hunk digests harden exact-coordinate reuse without changing public finding IDs; content-addressed public identity remains future work.
 - **Reason drift**: a carried reason may reference commit SHAs of the old round. Mitigated by provenance stamping — the verdict shows which run authored the reason.
 - **Rule-ID coupling**: tier 2 depends on closed rule enums staying stable across registry edits mid-loop. Registry is versioned and gate loops are short-lived; acceptable.
 

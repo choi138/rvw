@@ -13,18 +13,21 @@ This capability replaces a prose-and-copy-paste PR gate sequence with one artifa
 - Gate publication reuses the ordinary publish implementation, so COMMENT hardcoding, dry-run default, inline selection, and the bounded bulk 422 fallback have one code path.
 - Six tabelog PR #27 rounds (runs 051207 through 111704 on 2026-07-29) did not converge because every changed-head review forgot prior owner dispositions. Round 5 contained 55 actionable findings, about 45 of which were accepted re-detections or re-critiques of the immediately preceding fixes. Carrying validated acceptances is therefore a convergence mechanism, not merely a template convenience.
 - Runs 105629 and 111704 both reviewed head `f9936ad`. An unchanged head uses the existing artifact-backed resume path and MUST NOT be re-targeted for a fresh review; re-targeting an identical head is operator error. A changed head starts a new target run and may inherit from the prior run's validated verdict.
-- The persisted gate verdict is the inheritance source because its dispositions have already passed exact-ID, completeness, duplicate, unknown-ID, and owner checks. BLOCK verdicts remain useful sources for their accepted records; their `must_fix` records never carry.
+- The persisted gate verdict is the inheritance source because its dispositions have already passed exact-ID, completeness, duplicate, unknown-ID, and owner checks. BLOCK verdicts remain useful sources: their `must_fix` records never carry, but remain in the source set so mixed-disposition duplicate pairs stay ambiguous.
 - In target mode, `--inherit` source validation follows PR target resolution and precedes checkout provisioning and review execution.
-- Exact finding IDs include diff coordinates, so an unchanged ID can auto-carry while a unique `(file, rule_id)` match only prefills the reason for conscious re-acceptance. Duplicate pairs on either side deliberately under-carry.
+- Exact finding IDs encode diff coordinates rather than content. Tier-one carry therefore additionally compares SHA-256 digests of the persisted hunk text from each run. A changed or unavailable digest demotes to tier two; a unique `(file, rule_id)` match only prefills the reason for conscious re-acceptance. Duplicate pairs are counted across all inherited findings and all current actionable findings and deliberately under-carry.
+- Optional provenance remains backward compatible, but it is authoritative only after validation binds it to the selected source and a recomputed carried or prefilled match. Hand-authored provenance without that proof is rejected.
+- Partial-inheritance artifacts retain source-correlated carried, prefilled, and reasoned blank counts. Template comments distinguish changed-ID prefills, unmatched findings, prior-must-fix findings, ambiguity, and content-digest outcomes without weakening the strict YAML schema.
 
 ## Constraints
 
 - Gate targets GitHub pull requests and requires working `gh` and `git` commands plus authenticated repository access.
 - The checkout clone fetches GitHub's `refs/pull/<number>/head` before detaching at the captured SHA so fork pull requests do not depend on the base branch advertising the commit.
-- Finding IDs include hunk identity and are valid only while both persisted anchors remain current.
+- Public finding IDs include hunk coordinates but not content; automatic inheritance additionally requires equal known hunk digests.
 - Resume requires the ordinary run stages and `gate-plan.json` written by target mode.
 - A coverage failure identifies the missing, unexpected, or invalid replica-chunk identity from persisted artifacts.
 - Inheritance is limited to persisted verdicts for the same repository and pull-request number. Base and head anchors may differ between the source and inheriting runs.
+- Run IDs are direct child names beneath the configured artifact root. Dot components, separators, symlinked entries, and resolved escapes are invalid lookup inputs.
 
 ## Failure modes
 
@@ -32,6 +35,7 @@ This capability replaces a prose-and-copy-paste PR gate sequence with one artifa
 - GitHub installations without the pull-request ref namespace cannot use the current checkout provisioner.
 - Repository-admin authority may be narrower than an organization's informal owner group; configurable authority sources are outside this version.
 - `accepted` records a human judgment and cannot prove the judgment was substantively correct.
+- Legacy verdicts have no hunk digest. They remain readable, but exact-ID findings from them are conservatively handled as tier two until a digest-bearing verdict exists.
 
 ## Concrete example
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Literal
@@ -27,6 +28,10 @@ from rvw.target import ResolvedTarget
 
 runner = CliRunner()
 
+HUNK_TEXT = "@@ -1 +1 @@\n-old\n+new\n"
+HUNK_DIFF = f"diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n{HUNK_TEXT}"
+HUNK_SHA256 = hashlib.sha256(HUNK_TEXT.encode()).hexdigest()
+
 
 def target() -> ResolvedTarget:
     return ResolvedTarget(
@@ -35,7 +40,7 @@ def target() -> ResolvedTarget:
         base_sha="a" * 40,
         head_sha="b" * 40,
         changed_paths=["src/a.py"],
-        diff="diff --git a/src/a.py b/src/a.py\n",
+        diff=HUNK_DIFF,
         pr_number=42,
     )
 
@@ -64,7 +69,7 @@ def prepared_artifacts(
             EnrichedFinding(
                 rule_id="rule/actionable",
                 file="src/a.py",
-                hunk_id="src/a.py@@-1+1@@",
+                hunk_id="src/a.py@@-1,1+1,1@@",
                 line=1,
                 severity=Severity.BLOCKER if blocker else Severity.WARNING,
                 body="actionable",
@@ -184,6 +189,7 @@ def inherited_source(
                         verdict=Verdict.CONFIRMED,
                         disposition=DispositionDecision.ACCEPTED,
                         reason="accepted in prior run",
+                        hunk_sha256=HUNK_SHA256,
                     )
                 ],
                 verdict=verdict,
@@ -303,6 +309,20 @@ def test_gate_target_invalid_inherit_stops_before_provision_or_review(
     assert pipeline_calls == []
 
 
+def test_gate_target_rejects_traversal_inherit_as_invalid_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli_module, "_resolve_cli_target", lambda spec: target())
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--inherit", "..", "--out", str(tmp_path / "runs")],
+    )
+
+    assert result.exit_code == 2
+    assert "inherit_run_invalid" in result.stderr
+
+
 @pytest.mark.parametrize(
     ("source_setup", "reason"),
     [
@@ -347,12 +367,17 @@ def test_gate_inherit_source_errors_before_template_writing(
     assert not (current.run.dir / "gate-dispositions.yaml").exists()
 
 
-def test_block_verdict_source_contributes_only_accepted_findings(tmp_path: Path) -> None:
+def test_block_verdict_source_counts_mixed_dispositions_as_pair_ambiguity(
+    tmp_path: Path,
+) -> None:
     out_root = tmp_path / "runs"
     current = prepared_artifacts(out_root, actionable=True)
     source = inherited_source(out_root, current, verdict="BLOCK")
     source_verdict = GateVerdict.model_validate_json(
         (source.dir / "gate-verdict.json").read_text(encoding="utf-8")
+    )
+    source_verdict.findings[0] = source_verdict.findings[0].model_copy(
+        update={"finding_id": "prior-accepted-id"}
     )
     source_verdict.findings.append(
         source_verdict.findings[0].model_copy(
@@ -373,7 +398,24 @@ def test_block_verdict_source_contributes_only_accepted_findings(tmp_path: Path)
 
     assert loaded.run_id == source.run_id
     assert loaded.verdict == "BLOCK"
-    assert [finding.finding_id for finding in loaded.findings] == [current.merged.groups[0].key]
+    assert [finding.finding_id for finding in loaded.findings] == [
+        "prior-accepted-id",
+        "must-fix-id",
+    ]
+
+    group = current.merged.groups[0]
+    assert current.outcome is not None
+    matched = cli_module.match_inherited_dispositions(
+        loaded.findings,
+        current.merged,
+        current.outcome,
+        inherited_run_id=source.run_id,
+        current_hunk_sha256={group.key: HUNK_SHA256},
+    )[group.key]
+
+    assert matched.tier is None
+    assert matched.reason == ""
+    assert matched.blank_reason == "source_pair_ambiguous"
 
 
 def test_gate_checkout_failure_is_operational_error(
@@ -495,6 +537,47 @@ def test_gate_partial_inheritance_writes_prefilled_template_and_pauses(
     assert "decision: must_fix" in template
     assert "reason: accepted in prior run" in template
     assert "inherited_from: source-run" in template
+    assert "inheritance source=source-run carried=0 prefilled=1 blank=0" in result.stdout
+    verdict = json.loads((current.run.dir / "gate-verdict.json").read_text(encoding="utf-8"))
+    assert verdict["inheritance_summary"] == {
+        "source_run_id": "source-run",
+        "carried": 0,
+        "prefilled": 1,
+        "blank": 0,
+        "reasons": {"finding_id_changed": 1},
+    }
+    assert not (current.run.dir / "publish-payload.json").exists()
+
+
+def test_gate_exact_id_with_changed_hunk_digest_pauses_with_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current)
+    update_source_finding(source, hunk_sha256="0" * 64)
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--target",
+            "42",
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    template = (current.run.dir / "gate-dispositions.yaml").read_text(encoding="utf-8")
+    assert "decision: must_fix" in template
+    assert "reason: accepted in prior run" in template
+    assert "# blank_reason: content_changed" in template
+    verdict = json.loads((current.run.dir / "gate-verdict.json").read_text(encoding="utf-8"))
+    assert verdict["inheritance_summary"]["reasons"] == {"content_changed": 1}
     assert not (current.run.dir / "publish-payload.json").exists()
 
 
@@ -530,8 +613,103 @@ def test_gate_carried_blocker_reverifies_owner_authorization(
     assert permission_calls == ["owner/repo"]
     verdict = json.loads((current.run.dir / "gate-verdict.json").read_text(encoding="utf-8"))
     assert verdict["verdict"] == "BLOCK"
-    assert any("admin" in failure for failure in verdict["failures"])
+    failure = verdict["failures"][0]
+    assert current.merged.groups[0].key in failure
+    assert "contributor" in failure
+    assert "write" in failure
     assert not (current.run.dir / "publish-payload.json").exists()
+
+
+@pytest.mark.parametrize("source_case", ["absent", "wrong_run", "unmatched"])
+def test_gate_rejects_unbound_inherited_from_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_case: str,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        current.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    source = inherited_source(out_root, current) if source_case != "absent" else None
+    if source_case == "unmatched":
+        assert source is not None
+        update_source_finding(source, finding_id="other-id", file="src/other.py")
+    claim = "other-run" if source_case == "wrong_run" else "source-run"
+    finding_id = current.merged.groups[0].key
+    dispositions = tmp_path / f"{source_case}.yaml"
+    dispositions.write_text(
+        "schema_version: 1\ndispositions:\n"
+        f"  - finding_id: {finding_id}\n"
+        "    decision: accepted\n"
+        "    reason: reviewed\n"
+        f"    inherited_from: {claim}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+    args = [
+        "gate",
+        "--run",
+        current.run.run_id,
+        "--dispositions",
+        str(dispositions),
+        "--out",
+        str(out_root),
+    ]
+    if source is not None:
+        args.extend(["--inherit", source.run_id])
+
+    result = runner.invoke(cli_module.app, args)
+
+    assert result.exit_code == 1
+    assert "inherited_from_unbound" in result.stderr
+    verdict = json.loads((current.run.dir / "gate-verdict.json").read_text(encoding="utf-8"))
+    assert any("inherited_from_unbound" in failure for failure in verdict["failures"])
+
+
+def test_gate_allows_fresh_disposition_when_inheritance_source_is_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        current.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    source = inherited_source(out_root, current)
+    update_source_finding(source, finding_id="other-id", file="src/other.py")
+    finding_id = current.merged.groups[0].key
+    dispositions = tmp_path / "fresh.yaml"
+    dispositions.write_text(
+        "schema_version: 1\ndispositions:\n"
+        f"  - finding_id: {finding_id}\n"
+        "    decision: accepted\n"
+        "    reason: fresh review\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            current.run.run_id,
+            "--dispositions",
+            str(dispositions),
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    verdict = json.loads((current.run.dir / "gate-verdict.json").read_text(encoding="utf-8"))
+    assert verdict["findings"][0]["inherited_from"] is None
 
 
 def test_gate_resume_uses_artifacts_without_review(

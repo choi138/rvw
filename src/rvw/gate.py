@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from rvw.adjudicate import AdjudicationOutcome
 from rvw.discover import LaneCoverage
+from rvw.hunks import hunk_sha256_by_id
 from rvw.merge import CollapseGroup, MergeResult
 from rvw.schema import Severity, Verdict
 from rvw.target import ResolvedTarget
@@ -92,11 +93,27 @@ class GateFinding(BaseModel):
     disposition: DispositionDecision
     reason: str
     inherited_from: str | None = None
+    hunk_sha256: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class InheritanceTier(StrEnum):
     EXACT_ID = "exact_id"
     UNIQUE_PAIR = "unique_pair"
+
+
+class InheritanceBlankReason(StrEnum):
+    UNMATCHED = "unmatched"
+    PRIOR_MUST_FIX = "prior_must_fix"
+    SOURCE_PAIR_AMBIGUOUS = "source_pair_ambiguous"
+    CURRENT_PAIR_AMBIGUOUS = "current_pair_ambiguous"
+    CONTENT_CHANGED = "content_changed"
+    CONTENT_DIGEST_UNKNOWN = "content_digest_unknown"
+    FINDING_ID_CHANGED = "finding_id_changed"
 
 
 class DispositionInheritance(BaseModel):
@@ -109,6 +126,19 @@ class DispositionInheritance(BaseModel):
     reason: str = ""
     inherited_from: str | None = None
     tier: InheritanceTier | None = None
+    blank_reason: InheritanceBlankReason | None = None
+
+
+class InheritanceSummary(BaseModel):
+    """Aggregate outcomes for one selected inheritance source."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_run_id: str
+    carried: int = Field(ge=0)
+    prefilled: int = Field(ge=0)
+    blank: int = Field(ge=0)
+    reasons: dict[str, int] = Field(default_factory=dict)
 
 
 class GateVerdict(BaseModel):
@@ -125,6 +155,7 @@ class GateVerdict(BaseModel):
     actor: str | None = None
     verdict: Literal["PASS", "BLOCK"]
     failures: list[str] = Field(default_factory=list)
+    inheritance_summary: InheritanceSummary | None = None
 
 
 def load_dispositions(path: Path) -> DispositionDocument:
@@ -260,11 +291,13 @@ def match_inherited_dispositions(
     outcome: AdjudicationOutcome,
     *,
     inherited_run_id: str,
+    current_hunk_sha256: Mapping[str, str | None] | None = None,
 ) -> dict[str, DispositionInheritance]:
     """Match validated prior findings to the current actionable finding set."""
 
     actionable = [group for group, _ in _actionable(merged, outcome)]
-    results = {group.key: DispositionInheritance(finding_id=group.key) for group in actionable}
+    current_digests = current_hunk_sha256 or {}
+    results: dict[str, DispositionInheritance] = {}
     accepted_by_id = {
         finding.finding_id: finding
         for finding in inherited_findings
@@ -281,21 +314,54 @@ def match_inherited_dispositions(
     }
 
     for group in actionable:
-        if inherited := accepted_by_id.get(group.key):
-            results[group.key] = DispositionInheritance(
-                finding_id=group.key,
-                decision=DispositionDecision.ACCEPTED,
-                reason=inherited.reason,
-                inherited_from=inherited_run_id,
-                tier=InheritanceTier.EXACT_ID,
+        exact = accepted_by_id.get(group.key)
+        demotion_reason: InheritanceBlankReason | None = None
+        if exact is not None:
+            inherited_digest = exact.hunk_sha256
+            current_digest = current_digests.get(group.key)
+            if (
+                inherited_digest is not None
+                and current_digest is not None
+                and inherited_digest == current_digest
+            ):
+                results[group.key] = DispositionInheritance(
+                    finding_id=group.key,
+                    decision=DispositionDecision.ACCEPTED,
+                    reason=exact.reason,
+                    inherited_from=inherited_run_id,
+                    tier=InheritanceTier.EXACT_ID,
+                )
+                continue
+            demotion_reason = (
+                InheritanceBlankReason.CONTENT_CHANGED
+                if inherited_digest is not None and current_digest is not None
+                else InheritanceBlankReason.CONTENT_DIGEST_UNKNOWN
             )
-            continue
 
         pair = (group.file, group.rule_id)
-        if inherited_pair_counts[pair] != 1 or current_pair_counts[pair] != 1:
+        if inherited_pair_counts[pair] > 1:
+            results[group.key] = DispositionInheritance(
+                finding_id=group.key,
+                blank_reason=InheritanceBlankReason.SOURCE_PAIR_AMBIGUOUS,
+            )
+            continue
+        if current_pair_counts[pair] > 1:
+            results[group.key] = DispositionInheritance(
+                finding_id=group.key,
+                blank_reason=InheritanceBlankReason.CURRENT_PAIR_AMBIGUOUS,
+            )
             continue
         inherited = inherited_by_pair.get(pair)
         if inherited is None:
+            blank_reason = (
+                InheritanceBlankReason.PRIOR_MUST_FIX
+                if inherited_pair_counts[pair] == 1
+                else InheritanceBlankReason.UNMATCHED
+            )
+            results[group.key] = DispositionInheritance(
+                finding_id=group.key,
+                blank_reason=blank_reason,
+            )
             continue
         results[group.key] = DispositionInheritance(
             finding_id=group.key,
@@ -303,8 +369,60 @@ def match_inherited_dispositions(
             reason=inherited.reason,
             inherited_from=inherited_run_id,
             tier=InheritanceTier.UNIQUE_PAIR,
+            blank_reason=demotion_reason or InheritanceBlankReason.FINDING_ID_CHANGED,
         )
     return results
+
+
+def summarize_inheritance(
+    inheritance: Mapping[str, DispositionInheritance],
+    *,
+    source_run_id: str,
+) -> InheritanceSummary:
+    carried = 0
+    prefilled = 0
+    blank = 0
+    reasons: Counter[str] = Counter()
+    for result in inheritance.values():
+        if result.tier is InheritanceTier.EXACT_ID:
+            carried += 1
+        elif result.reason:
+            prefilled += 1
+        else:
+            blank += 1
+        if result.blank_reason is not None:
+            reasons[result.blank_reason.value] += 1
+    return InheritanceSummary(
+        source_run_id=source_run_id,
+        carried=carried,
+        prefilled=prefilled,
+        blank=blank,
+        reasons=dict(sorted(reasons.items())),
+    )
+
+
+def _validate_inherited_from(
+    dispositions: Mapping[str, DispositionRecord],
+    *,
+    inherited_run_id: str | None,
+    inheritance: Mapping[str, DispositionInheritance] | None,
+) -> None:
+    for finding_id, record in dispositions.items():
+        if record.inherited_from is None:
+            continue
+        matched = inheritance.get(finding_id) if inheritance is not None else None
+        if (
+            inherited_run_id is None
+            or record.inherited_from != inherited_run_id
+            or matched is None
+            or matched.tier is None
+            or matched.inherited_from != inherited_run_id
+        ):
+            raise GateInvariantError(
+                "inherited_from_unbound: "
+                f"finding {finding_id} claims {record.inherited_from!r} without a matching "
+                "selected inheritance source"
+            )
 
 
 def build_gate_verdict(
@@ -317,6 +435,9 @@ def build_gate_verdict(
     dispositions: DispositionDocument,
     actor: str | None = None,
     actor_permission: str | None = None,
+    inherited_run_id: str | None = None,
+    inheritance: Mapping[str, DispositionInheritance] | None = None,
+    inheritance_summary: InheritanceSummary | None = None,
 ) -> GateVerdict:
     if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
         raise GateInvariantError("gate verdict requires a PR target with base and head anchors")
@@ -324,6 +445,12 @@ def build_gate_verdict(
     actionable = _actionable(merged, outcome)
     expected_ids = {group.key for group, _ in actionable}
     by_id = _dispositions_by_id(dispositions, expected_ids)
+    _validate_inherited_from(
+        by_id,
+        inherited_run_id=inherited_run_id,
+        inheritance=inheritance,
+    )
+    hunk_digests = hunk_sha256_by_id(target.diff)
     findings: list[GateFinding] = []
     accepted_blocker = False
     blocked = False
@@ -335,7 +462,9 @@ def build_gate_verdict(
             accepted_blocker = True
             if actor_permission != "admin" or not actor:
                 raise GateInvariantError(
-                    "accepted blocker requires an authenticated actor with repository admin permission"
+                    "accepted_blocker_owner_unverified: "
+                    f"finding_id={group.key} actor={actor or '<none>'} "
+                    f"permission={actor_permission or '<none>'}; repository admin required"
                 )
         findings.append(
             GateFinding(
@@ -348,6 +477,7 @@ def build_gate_verdict(
                 disposition=record.decision,
                 reason=record.reason,
                 inherited_from=record.inherited_from,
+                hunk_sha256=hunk_digests.get(group.hunk_id),
             )
         )
 
@@ -362,6 +492,7 @@ def build_gate_verdict(
         findings=findings,
         actor=actor if accepted_blocker else None,
         verdict="BLOCK" if blocked else "PASS",
+        inheritance_summary=inheritance_summary,
     )
 
 
@@ -369,14 +500,23 @@ def requires_owner_authorization(
     merged: MergeResult,
     outcome: AdjudicationOutcome,
     dispositions: DispositionDocument,
+    *,
+    inherited_run_id: str | None = None,
+    inheritance: Mapping[str, DispositionInheritance] | None = None,
 ) -> bool:
-    by_id = {record.finding_id: record for record in dispositions.dispositions}
+    actionable = _actionable(merged, outcome)
+    by_id = _dispositions_by_id(dispositions, {group.key for group, _ in actionable})
+    _validate_inherited_from(
+        by_id,
+        inherited_run_id=inherited_run_id,
+        inheritance=inheritance,
+    )
     return any(
         group.severity is Severity.BLOCKER
         and outcome.verdicts.get(group.key) in {Verdict.CONFIRMED, Verdict.UNCERTAIN}
         and (record := by_id.get(group.key)) is not None
         and record.decision is DispositionDecision.ACCEPTED
-        for group in merged.groups
+        for group, _ in actionable
     )
 
 
@@ -387,7 +527,7 @@ def write_disposition_template(
     *,
     inheritance: Mapping[str, DispositionInheritance] | None = None,
 ) -> Path:
-    records: list[dict[str, str]] = []
+    records: list[tuple[dict[str, str], InheritanceBlankReason | None]] = []
     for group, _ in _actionable(merged, outcome):
         matched = inheritance.get(group.key) if inheritance is not None else None
         record = {
@@ -401,16 +541,15 @@ def write_disposition_template(
         }
         if matched is not None and matched.inherited_from is not None:
             record["inherited_from"] = matched.inherited_from
-        records.append(record)
-    template = {
-        "schema_version": 1,
-        "dispositions": records,
-    }
+        records.append((record, matched.blank_reason if matched is not None else None))
+    lines = ["schema_version: 1", "dispositions:" if records else "dispositions: []"]
+    for record, blank_reason in records:
+        dumped = yaml.safe_dump([record], sort_keys=False, allow_unicode=True).rstrip("\n")
+        lines.extend(dumped.splitlines())
+        if blank_reason is not None:
+            lines.append(f"  # blank_reason: {blank_reason.value}")
     path = run_dir / "gate-dispositions.yaml"
-    path.write_text(
-        yaml.safe_dump(template, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 
 
@@ -467,6 +606,23 @@ def render_gate_verdict(verdict: GateVerdict) -> str:
         lines.append("| — | — | — | — | — | No actionable findings |")
     if verdict.actor is not None:
         lines.extend(["", f"Verified blocker-acceptance actor: `{verdict.actor}`"])
+    if verdict.inheritance_summary is not None:
+        summary = verdict.inheritance_summary
+        reasons = (
+            ", ".join(f"{reason}={count}" for reason, count in summary.reasons.items()) or "none"
+        )
+        lines.extend(
+            [
+                "",
+                "## Inheritance summary",
+                "",
+                f"Source run: `{summary.source_run_id}`",
+                (
+                    f"Carried: {summary.carried}; prefilled: {summary.prefilled}; "
+                    f"blank: {summary.blank}; reasons: {reasons}"
+                ),
+            ]
+        )
     if verdict.failures:
         lines.extend(["", "## Failures", "", *(f"- {_cell(item)}" for item in verdict.failures)])
     return "\n".join(lines) + "\n"
@@ -580,6 +736,8 @@ __all__ = [
     "GateInvariantError",
     "GatePlan",
     "GateVerdict",
+    "InheritanceBlankReason",
+    "InheritanceSummary",
     "InheritanceTier",
     "PullRequestState",
     "build_gate_verdict",
@@ -593,6 +751,7 @@ __all__ = [
     "requires_owner_authorization",
     "save_gate_plan",
     "save_gate_verdict",
+    "summarize_inheritance",
     "validate_coverage",
     "verify_pull_request",
     "write_disposition_template",

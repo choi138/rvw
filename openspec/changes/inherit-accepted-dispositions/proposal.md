@@ -5,10 +5,10 @@ The six-round tabelog PR #27 gate loop demonstrated a structural non-convergence
 ## What Changes
 
 - Add an `--inherit <run-id>` option to `rvw gate` (valid in both target and resume modes) that loads a prior validated gate verdict for the same repository and pull request and carries its `accepted` dispositions forward.
-- Carry rules are fail-closed and tiered: an exact public finding-ID match auto-carries the accepted decision and reason with provenance; a unique `(file, rule_id)` match with a changed hunk prefills the prior reason into the template but keeps the decision `must_fix` so a human must consciously re-accept; ambiguous matches and everything else fall back to today's blank template entries.
+- Carry rules are fail-closed and tiered: an exact public finding-ID match auto-carries only when the persisted hunk-content digest also matches; a unique `(file, rule_id)` match with changed or unknown content prefills the prior reason into the template but keeps the decision `must_fix` so a human must consciously re-accept; ambiguous matches and everything else fall back to blank template entries with machine-readable diagnostic comments.
 - `must_fix` dispositions never carry in any tier; REJECTED groups remain non-actionable as today.
 - When every actionable finding of the new run is covered by exact-match carried acceptances, gate persists the generated disposition document and proceeds directly to validation in the same invocation instead of pausing for a resume round.
-- Record inheritance provenance (`inherited_from` run ID) on carried disposition records and in the gate verdict artifact so verdicts remain reconstructable.
+- Record inheritance provenance (`inherited_from` run ID) on carried disposition records and in the gate verdict artifact, and reject provenance that is not bound to the selected source and a recomputed match.
 - Document in the pr-gate context that an unchanged head MUST be resumed (`rvw gate --run`), not re-targeted; target-mode re-review of an identical head is operator error, and `--inherit` composes with resume for the changed-head case.
 
 ## Capabilities
