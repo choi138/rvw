@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/Soju06/rvw/compare/v0.4.1...v0.5.0) (2026-07-30)
+
+
+### Features
+
+* **review:** default to single-pass review (replicas=1) ([#7](https://github.com/Soju06/rvw/issues/7)) ([0deac24](https://github.com/Soju06/rvw/commit/0deac24d1f76d3c29c485410c161cfacd56c837b))
+
 ## [0.4.1](https://github.com/Soju06/rvw/compare/v0.4.0...v0.4.1) (2026-07-29)
 
 
